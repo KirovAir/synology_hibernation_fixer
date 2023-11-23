@@ -1,0 +1,104 @@
+# scemd
+OLD:
+48 89 EE BF 01 00 00 00 48 89 04 24 E8(....) 48 89 EE BF 02 00 00 00 89 C3 E8(....) 
+48 89 EE BF 07 00 00 00 E8(....) 85 DB
+NEW:        ||
+48 89 EE BF 0B 00 00 00 E8(....) 85 DB
+
+# synostoraged
+48 89 DE BF 03 00 00 00 E8(....) 85 C0 0F 88(....) 
+48 89 DE BF 07 00 00 00 E8(....) 85 C0 0F 88(....) 48 89 DE BF 0B 00 00 00 E8
+|| || NEW:
+EB 13 DE BF 07 00 00 00 E8
+
+int __fastcall poller_hibernation_checks_and_raises()
+{
+signed int sleep_timeout_normal; // ebx
+int sleep_timeout_deep; // ebp
+
+if ( !bSleepTimersInitialized )
+{
+if ( !get_SYSTEM_MODE() )
+return 0;
+
+disable_sleep_timers(); // starts from this. Event 16 (INIT) sets real values then
+
+scemd_event_handler_RAISE_event(29LL); // who handles it? Noone?
+
+bSleepTimersInitialized = 1;
+}
+
+
+sleep_timeout_normal = 60 * get_sleep_timer_by_type(1); // function returns in minutes
+if ( sleep_timeout_normal <= 0 )
+return 0;
+
+
+if ( check_if_disks_reached_sleep_timeout(sleep_timeout_normal) )// calls DiskListIdleEnough()
+{
+if ( get_SYSTEM_MODE() == 1 ) // MODE 1: on (aka WORKING)
+{
+if ( IsInternalDiskSelfTesting()
+|| !SLIBCSupportLedBehaviorV2() && (get_LED_related_mode() == 2 || get_LED_related_mode() == 3) )// reads support_led_behavior_v2 (which is yes)
+{
+return 0;
+}
+
+set_SYSTEM_MODE(2); // MODE 2: regular sleep
+scemd_event_handler_RAISE_event(31LL); // 31 = GOING TO SLEEP (regular)
+sleep(10u);
+}
+
+
+sleep_timeout_deep = 60 * get_sleep_timer_by_type(2);
+
+if ( sleep_timeout_deep > 0
+&& get_SYSTEM_MODE() == 2 // MODE 2: regular sleep
+&& get_SYSTEM_MODE() != 3 // MODE 3: deep sleep
+&& check_if_disks_reached_sleep_timeout(sleep_timeout_normal + sleep_timeout_deep) )// FYI: uses /sys/block/%s/device/syno_idle_time
+{
+set_SYSTEM_MODE(3); // MODE 3: deep sleep
+scemd_event_handler_RAISE_event(32LL); // 32 = GOING TO DEEP SLEEP
+}
+}
+else
+{
+if ( get_SYSTEM_MODE() == 2 ) // MODE 2: regular sleep
+{
+scemd_event_handler_RAISE_event(30LL); // 30 = WAKE UP
+scemd_event_handler_RAISE_event(102LL); // calls save_info_to_disk_overview_xml()
+}
+
+if ( get_SYSTEM_MODE() == 3 ) // MODE 3: deep sleep
+{
+scemd_event_handler_RAISE_event(37LL);
+scemd_event_handler_RAISE_event(33LL);
+scemd_event_handler_RAISE_event(30LL); // 30 = WAKE UP
+scemd_event_handler_RAISE_event(103LL); // calls save_crap_to_disk_overview_xml()
+}
+
+if ( get_SYSTEM_MODE() != 6 )
+set_SYSTEM_MODE(1);
+}
+
+return 0;
+}
+
+scemd_patchset = BinaryPatchSet("scemd", SCEMD_PATH, [
+    (b'\x48\x89\xDE\xBF\x01\x00\x00\x00\x48\x89\x04\x24\xE8(....)\x48\x89\xDE\xBF\x02\x00\x00\x00\x89\xC5\xE8(....)\x48\x89\xDE\xBF\x07\x00\x00\x00\xE8(....)\x85\xED',
+     b'\x48\x89\xDE\xBF\x01\x00\x00\x00\x48\x89\x04\x24\xE8\g<01>\x48\x89\xDE\xBF\x02\x00\x00\x00\x89\xC5\xE8\g<02>\x48\x89\xDE\xBF\x0B\x00\x00\x00\xE8\g<03>\x85\xED',
+     "NVMe I/O HDD hibernation fix for DSM 7.0-7.1"),
+    (b'\x48\x89\xEE\xBF\x01\x00\x00\x00\x48\x89\x04\x24\xE8(....)\x48\x89\xEE\xBF\x02\x00\x00\x00\x89\xC3\xE8(....)\x48\x89\xEE\xBF\x07\x00\x00\x00\xE8(....)\x85\xDB',
+     b'\x48\x89\xEE\xBF\x01\x00\x00\x00\x48\x89\x04\x24\xE8\g<01>\x48\x89\xEE\xBF\x02\x00\x00\x00\x89\xC3\xE8\g<02>\x48\x89\xEE\xBF\x0B\x00\x00\x00\xE8\g<03>\x85\xDB',
+     "NVMe I/O HDD hibernation fix for DSM 7.2"),
+    ])
+
+synostoraged_patchset = BinaryPatchSet("synostgd-disk", SYNOSTORAGED_PATH, [
+    (b'\x4C\x89\xEE\xBF\x03\x00\x00\x00\xE8(....)\x85\xC0\x0F\x88(....)\x4C\x89\xEE\xBF\x07\x00\x00\x00\xE8(....)\x85\xC0\x0F\x88(....)\x4C\x89\xEE\xBF\x0B\x00\x00\x00\xE8',
+     b'\x4C\x89\xEE\xBF\x03\x00\x00\x00\xE8\g<01>\x85\xC0\x0F\x88\g<02>\xEB\x13\xEE\xBF\x07\x00\x00\x00\xE8\g<03>\x85\xC0\x0F\x88\g<04>\x4C\x89\xEE\xBF\x0B\x00\x00\x00\xE8',
+     "NVMe I/O HDD hibernation fix for DSM 7.0-7.1"),
+    (b'\x48\x89\xDE\xBF\x03\x00\x00\x00\xE8(....)\x85\xC0\x0F\x88(....)\x48\x89\xDE\xBF\x07\x00\x00\x00\xE8(....)\x85\xC0\x0F\x88(....)\x48\x89\xDE\xBF\x0B\x00\x00\x00\xE8',
+     b'\x48\x89\xDE\xBF\x03\x00\x00\x00\xE8\g<01>\x85\xC0\x0F\x88\g<02>\xEB\x13\xDE\xBF\x07\x00\x00\x00\xE8\g<03>\x85\xC0\x0F\x88\g<04>\x48\x89\xDE\xBF\x0B\x00\x00\x00\xE8',
+     "NVMe I/O HDD hibernation fix for DSM 7.2"),
+    ])
+
