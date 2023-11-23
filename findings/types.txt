@@ -1,0 +1,31 @@
+1: SATA
+- 2: ESATA
+- 3: EUNIT
+- 4: USB (has "usb")
+- 5: SYNOBOOT (has "synoboot")
+- 6: ISCSI (has "iscsi")
+- 7: CACHE
+- 8: USBHUB
+- 9: SDCARD (has "mmcblk")
+- 10: INVALID
+- 11: SYS
+- default: UNKNOWN
+
+port types:
+
+- invalid: 1
+- internal: 2
+- ssdcache: 3
+- external: 4
+- system: 5
+- others: 0
+
+
+scemd system modes:
+
+- 1: WORKING
+- 2: REGULAR_DISK_SLEEP
+- 3: DEEP_DISK_SLEEP
+- 4:
+- 5: UPS SAFE MODE
+- 6: SHUTDOWN
