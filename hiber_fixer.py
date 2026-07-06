@@ -1,46 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Synology DSM HDD hibernation fixer
-==================================
+Synology DSM HDD hibernation fixer (x86 NAS, DSM 7.0 - 7.3).
 
-Makes the hard drives of an x86 Synology NAS actually spin down (hibernate) by
-removing the things that keep waking them up. Tested target: DSM 7.0 - 7.3.
+Makes the hard drives spin down (hibernate) by removing what keeps waking them.
+`--run` applies four fixes: (1) an in-memory patch of the running scemd / synostgd-disk
+processes so ongoing NVMe I/O no longer blocks HDD hibernation (reapplied each boot;
+the on-disk binary is never touched), (2) synocrond task tuning driven by an external
+JSON config, (3) noatime for / and (opt-in) data volumes, (4) synocached idle timeout
+3600 -> 900s.
 
-What it does (all applied by ``--run``):
+`--install` copies this script to a data volume (default /volume1/hiber_fixer), writes a
+config file beside it, and creates a boot-up Task Scheduler task that just runs this
+script -- no compressed copy embedded in the task. Both survive DSM upgrades.
 
-  1. NVMe hibernation fix  -- patches the *running* ``scemd`` and ``synostgd-disk``
-     processes in memory so that ongoing NVMe I/O no longer blocks HDD
-     hibernation (the classic "Docker on an NVMe volume keeps my HDDs awake"
-     problem). Nothing on disk is modified, so this must run once per boot.
-  2. synocrond task tuning -- slows down or deletes the many built-in background
-     jobs (disk health, BTRFS maintenance, data collection, ...) that wake disks.
-     Which job does what is declared in an external JSON config file.
-  3. noatime           -- remounts ``/`` noatime and (optionally) sets data
-     volumes to noatime, to stop access-time writes from waking disks.
-  4. synocached        -- lowers the redis/synocached idle timeout 3600 -> 900s.
-
-How it persists
----------------
-``--install`` copies this script to a data volume (default /volume1/hiber_fixer),
-writes a config file next to it, and creates a **boot-up Task Scheduler task that
-simply runs this script** (``python3 .../hiber_fixer.py --run``). No compressed
-copy of the script is embedded in the task. Both the task (kept in DSM's DB) and
-the script (on a user volume) survive DSM upgrades.
-
-Usage
------
     sudo python3 hiber_fixer.py --install [--install-dir DIR]
-    sudo python3 hiber_fixer.py --run          # apply everything now (used by the task)
-    sudo python3 hiber_fixer.py --status        # show current state
-    sudo python3 hiber_fixer.py --configure     # interactively edit the config
-    sudo python3 hiber_fixer.py --diagnose      # dump patch-site info (for new DSM builds)
+    sudo python3 hiber_fixer.py --run | --status | --diagnose | --configure
     sudo python3 hiber_fixer.py --uninstall [--purge]
 """
 
 from __future__ import annotations
 
 import argparse
+import configparser
 import ctypes
 import fnmatch
 import json
@@ -49,12 +31,10 @@ import os
 import platform
 import re
 import shutil
-import signal
 import struct
 import subprocess
 import sys
 import time
-from ctypes import CDLL, POINTER, Structure, c_int, c_size_t, c_ssize_t, c_uint64, c_ulong, c_void_p, cast, create_string_buffer
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -65,6 +45,7 @@ from typing import Dict, List, Optional, Tuple
 TASK_NAME = "HDD Hibernation Fixer task"          # kept identical to the old script so --install replaces it
 DEFAULT_INSTALL_DIR = "/volume1/hiber_fixer"
 CONFIG_BASENAME = "hiber_fixer.config.json"
+CONFIG_COMMENT = "Actions: unchanged|hourly|daily|weekly|monthly|delete. Edit, then re-run --run."
 LOG_PATH = "/var/log/hibernation_fixer.log"
 BACKUP_DIR = "/var/synobackup"
 
@@ -89,73 +70,73 @@ SYNOCROND_TASK_DIRS = [
     "/usr/local/etc/synocron.d/",
 ]
 
-VALID_ACTIONS = ("unchanged", "hourly", "daily", "weekly", "monthly", "delete")
 PERIOD_ACTIONS = ("hourly", "daily", "weekly", "monthly")
-
 BOOT_WAIT_TIMEOUT = 180           # seconds to wait for the system to finish booting
 
 log = logging.getLogger("hiber_fixer")
 
 
 # --------------------------------------------------------------------------- #
-# Recommended default action for each known synocrond task.
-# Unknown tasks (e.g. added by a future DSM/package) default to "unchanged".
+# Known synocrond tasks: name -> (recommended action, short description).
+# Single source of truth; unknown tasks (future DSM/package) default to "unchanged".
 # --------------------------------------------------------------------------- #
 
-DEFAULT_TASK_ACTIONS: Dict[str, str] = {
-    "builtin-synodbud-synodbud": "delete",
-    "builtin-dyn-synodbud-default": "delete",
-    "builtin-dyn-autopkgupgrade-default": "delete",
-    "builtin-libhwcontrol-disk_daily_routine": "weekly",
-    "builtin-libhwcontrol-disk_monthly_routine": "monthly",
-    "builtin-libhwcontrol-disk_weekly_routine": "weekly",
-    "builtin-libhwcontrol-syno_disk_health_record": "weekly",
-    "builtin-libsynostorage-syno_disk_health_record": "weekly",
-    "builtin-synobtrfssnap-synobtrfssnap": "monthly",
-    "builtin-synobtrfssnap-synostgreclaim": "monthly",
-    "builtin-synocrond_btrfs_free_space_analyze-default": "monthly",
-    "builtin-synodatacollect-udc": "delete",
-    "builtin-synodatacollect-udc-disk": "delete",
-    "builtin-synorenewdefaultcert-renew_default_certificate": "monthly",
-    "builtin-synorenewdefaultcert-default": "monthly",
-    "builtin-synosharesnaptree_reconstruct-default": "weekly",
-    "builtin-synosharing-default": "monthly",
-    "builtin-synolegalnotifier-synolegalnotifier": "monthly",
-    "builtin-synolegalnotifier-default": "monthly",
-    "builtin-syno_ew_weekly_check-extended_warranty_check": "monthly",
-    "builtin-syno_ew_weekly_check-default": "monthly",
-    "builtin-syno_ntp_status_check-check_ntp_status": "monthly",
-    "builtin-syno_ntp_status_check-default": "monthly",
-    "builtin-libsynostorage-syno_disk_db_update": "monthly",
-    "builtin-libsynostorage-syno_btrfs_metadata_check": "monthly",
-    "builtin-libsynostorage-syno_disk_mail_send": "weekly",
-    "pkg-ReplicationService-synobtrfsreplicacore-clean": "monthly",
-    "builtin-Docker-docker_check_image_upgradable_job": "weekly",
-    "pkg-Docker-docker_check_image_upgradable_job": "weekly",
-    "pkg-Docker-default": "weekly",
-    "builtin-ContainerManager-docker_check_image_upgradable_job": "weekly",
-    "pkg-ContainerManager-docker_check_image_upgradable_job": "weekly",
-    "builtin-configautobackup-configautobackup": "unchanged",
-    "builtin-dyn-configautobackup-default": "unchanged",
-    "builtin-myds-job": "weekly",
-    "builtin-dyn-myds-job": "weekly",
-    "builtin-autopkgupgrade-autopkgupgrade": "weekly",
-    "builtin-synoupgrade_routine-default": "unchanged",
-    "builtin-dyn-syno-letsencrypt-syno-letsencrypt - renew": "unchanged",
-    "builtin-Spreadsheet-auto_clean_weekly": "monthly",
-    "builtin-Spreadsheet-auto_office_clean_temp_daily": "weekly",
-    "builtin-SynologyDrive-caculate-db-usage": "weekly",
-    "builtin-SynologyDrive-cleanup-db": "weekly",
-    "builtin-SynologyPhotos-SynologyPhotosDatabaseToolVacuum": "weekly",
-    "builtin-CodecPack-CodecPackCheckAndUpdate": "monthly",
-    "builtin-SynologyApplicationService-auto_vacuum_daily": "weekly",
-    "builtin-DownloadStation-DownloadStationUpdateJob": "monthly",
-    "builtin-DownloadStation-DownloadStationMonitorTransmissionJob": "weekly",
-    "pkg-SynologyApplicationService-auto_vacuum_daily": "weekly",
-    "pkg-SMBService-smb_stats_update_job": "weekly",
-    "pkg-SynoAnalytics-synoanalytics": "delete",
-    "pkg-WebStation-webstaion_job": "weekly",
+TASK_DEFAULTS = {   # task name -> (recommended action, short description)
+    "builtin-synodbud-synodbud": ("delete", "updates misc DBs (abuser-blocklist, geoip, ca-certs, securityscan)"),
+    "builtin-dyn-synodbud-default": ("delete", "updates misc DBs (abuser-blocklist, geoip, ca-certs, securityscan)"),
+    "builtin-dyn-autopkgupgrade-default": ("delete", "update checker for installed packages"),
+    "builtin-libhwcontrol-disk_daily_routine": ("weekly", "disk SMART info collector"),
+    "builtin-libhwcontrol-disk_monthly_routine": ("monthly", "HDD performance-stats monitor"),
+    "builtin-libhwcontrol-disk_weekly_routine": ("weekly", "checks SMART/hotspare status for disks"),
+    "builtin-libhwcontrol-syno_disk_health_record": ("weekly", "parses disk_overview.xml (remaining life, errors, ...)"),
+    "builtin-libsynostorage-syno_disk_health_record": ("weekly", "parses disk_overview.xml (remaining life, errors, ...)"),
+    "builtin-synobtrfssnap-synobtrfssnap": ("monthly", "cleans up deleted BTRFS subvolumes"),
+    "builtin-synobtrfssnap-synostgreclaim": ("monthly", "checks number of deleted BTRFS volumes to reclaim"),
+    "builtin-synocrond_btrfs_free_space_analyze-default": ("monthly", "calculates BTRFS fragmentation per volume"),
+    "builtin-synodatacollect-udc": ("delete", "user data collection"),
+    "builtin-synodatacollect-udc-disk": ("delete", "user data collection (disk)"),
+    "builtin-synorenewdefaultcert-renew_default_certificate": ("monthly", "manages cryptographic certificates"),
+    "builtin-synorenewdefaultcert-default": ("monthly", "manages cryptographic certificates"),
+    "builtin-synosharesnaptree_reconstruct-default": ("weekly", "reconstructs BTRFS snapshot tree"),
+    "builtin-synosharing-default": ("monthly", "cleans up sharing.db SQLite tables"),
+    "builtin-synolegalnotifier-synolegalnotifier": ("monthly", "downloads user agreements from Synology"),
+    "builtin-synolegalnotifier-default": ("monthly", "downloads user agreements from Synology"),
+    "builtin-syno_ew_weekly_check-extended_warranty_check": ("monthly", "queries Synology for extended-warranty info"),
+    "builtin-syno_ew_weekly_check-default": ("monthly", "queries Synology for extended-warranty info"),
+    "builtin-syno_ntp_status_check-check_ntp_status": ("monthly", "runs NTP time sync"),
+    "builtin-syno_ntp_status_check-default": ("monthly", "runs NTP time sync"),
+    "builtin-libsynostorage-syno_disk_db_update": ("monthly", "downloads/extracts disk compatibility DB"),
+    "builtin-libsynostorage-syno_btrfs_metadata_check": ("monthly", "checks BTRFS metadata usage, emails alerts"),
+    "builtin-libsynostorage-syno_disk_mail_send": ("weekly", "sends disk-related notification e-mails"),
+    "pkg-ReplicationService-synobtrfsreplicacore-clean": ("monthly", "cleans up received BTRFS backup snapshots"),
+    "builtin-Docker-docker_check_image_upgradable_job": ("weekly", "Docker upgradable-image checker"),
+    "pkg-Docker-docker_check_image_upgradable_job": ("weekly", "Docker upgradable-image checker"),
+    "pkg-Docker-default": ("weekly", ""),
+    "builtin-ContainerManager-docker_check_image_upgradable_job": ("weekly", ""),
+    "pkg-ContainerManager-docker_check_image_upgradable_job": ("weekly", "Container Manager upgradable-image checker"),
+    "builtin-configautobackup-configautobackup": ("unchanged", ""),
+    "builtin-dyn-configautobackup-default": ("unchanged", ""),
+    "builtin-myds-job": ("weekly", ""),
+    "builtin-dyn-myds-job": ("weekly", ""),
+    "builtin-autopkgupgrade-autopkgupgrade": ("weekly", ""),
+    "builtin-synoupgrade_routine-default": ("unchanged", "DSM upgrade routine"),
+    "builtin-dyn-syno-letsencrypt-syno-letsencrypt - renew": ("unchanged", "renews Let's Encrypt certificates"),
+    "builtin-Spreadsheet-auto_clean_weekly": ("monthly", ""),
+    "builtin-Spreadsheet-auto_office_clean_temp_daily": ("weekly", ""),
+    "builtin-SynologyDrive-caculate-db-usage": ("weekly", ""),
+    "builtin-SynologyDrive-cleanup-db": ("weekly", ""),
+    "builtin-SynologyPhotos-SynologyPhotosDatabaseToolVacuum": ("weekly", ""),
+    "builtin-CodecPack-CodecPackCheckAndUpdate": ("monthly", ""),
+    "builtin-SynologyApplicationService-auto_vacuum_daily": ("weekly", ""),
+    "builtin-DownloadStation-DownloadStationUpdateJob": ("monthly", ""),
+    "builtin-DownloadStation-DownloadStationMonitorTransmissionJob": ("weekly", ""),
+    "pkg-SynologyApplicationService-auto_vacuum_daily": ("weekly", ""),
+    "pkg-SMBService-smb_stats_update_job": ("weekly", "updates SMB usage statistics"),
+    "pkg-SynoAnalytics-synoanalytics": ("delete", "Synology analytics / data collection"),
+    "pkg-WebStation-webstaion_job": ("weekly", "Web Station cron job"),
 }
+
+DEFAULT_TASK_ACTIONS: Dict[str, str] = {name: action for name, (action, _desc) in TASK_DEFAULTS.items()}
 
 DEFAULT_FIXES = {
     "nvme_in_memory_patch": True,
@@ -164,49 +145,11 @@ DEFAULT_FIXES = {
     "set_volumes_noatime": False,   # requires a reboot; opt-in only
 }
 
-# Short descriptions shown by --status / --configure.
-TASK_DESCRIPTIONS: Dict[str, str] = {
-    "builtin-synodbud-synodbud": "updates misc DBs (abuser-blocklist, geoip, ca-certs, securityscan)",
-    "builtin-dyn-synodbud-default": "updates misc DBs (abuser-blocklist, geoip, ca-certs, securityscan)",
-    "builtin-dyn-autopkgupgrade-default": "update checker for installed packages",
-    "builtin-libhwcontrol-disk_daily_routine": "disk SMART info collector",
-    "builtin-libhwcontrol-disk_monthly_routine": "HDD performance-stats monitor",
-    "builtin-libhwcontrol-disk_weekly_routine": "checks SMART/hotspare status for disks",
-    "builtin-libhwcontrol-syno_disk_health_record": "parses disk_overview.xml (remaining life, errors, ...)",
-    "builtin-libsynostorage-syno_disk_health_record": "parses disk_overview.xml (remaining life, errors, ...)",
-    "builtin-synobtrfssnap-synobtrfssnap": "cleans up deleted BTRFS subvolumes",
-    "builtin-synobtrfssnap-synostgreclaim": "checks number of deleted BTRFS volumes to reclaim",
-    "builtin-synocrond_btrfs_free_space_analyze-default": "calculates BTRFS fragmentation per volume",
-    "builtin-synodatacollect-udc": "user data collection",
-    "builtin-synodatacollect-udc-disk": "user data collection (disk)",
-    "builtin-synorenewdefaultcert-renew_default_certificate": "manages cryptographic certificates",
-    "builtin-synorenewdefaultcert-default": "manages cryptographic certificates",
-    "builtin-synosharesnaptree_reconstruct-default": "reconstructs BTRFS snapshot tree",
-    "builtin-synosharing-default": "cleans up sharing.db SQLite tables",
-    "builtin-synolegalnotifier-synolegalnotifier": "downloads user agreements from Synology",
-    "builtin-synolegalnotifier-default": "downloads user agreements from Synology",
-    "builtin-syno_ew_weekly_check-extended_warranty_check": "queries Synology for extended-warranty info",
-    "builtin-syno_ew_weekly_check-default": "queries Synology for extended-warranty info",
-    "builtin-syno_ntp_status_check-check_ntp_status": "runs NTP time sync",
-    "builtin-syno_ntp_status_check-default": "runs NTP time sync",
-    "builtin-libsynostorage-syno_disk_db_update": "downloads/extracts disk compatibility DB",
-    "builtin-libsynostorage-syno_btrfs_metadata_check": "checks BTRFS metadata usage, emails alerts",
-    "builtin-libsynostorage-syno_disk_mail_send": "sends disk-related notification e-mails",
-    "pkg-ReplicationService-synobtrfsreplicacore-clean": "cleans up received BTRFS backup snapshots",
-    "builtin-Docker-docker_check_image_upgradable_job": "Docker upgradable-image checker",
-    "pkg-Docker-docker_check_image_upgradable_job": "Docker upgradable-image checker",
-    "pkg-ContainerManager-docker_check_image_upgradable_job": "Container Manager upgradable-image checker",
-    "builtin-synoupgrade_routine-default": "DSM upgrade routine",
-    "pkg-SMBService-smb_stats_update_job": "updates SMB usage statistics",
-    "pkg-SynoAnalytics-synoanalytics": "Synology analytics / data collection",
-    "pkg-WebStation-webstaion_job": "Web Station cron job",
-    "builtin-dyn-syno-letsencrypt-syno-letsencrypt - renew": "renews Let's Encrypt certificates",
-}
-
 
 def describe_task(name: str) -> str:
-    if name in TASK_DESCRIPTIONS:
-        return TASK_DESCRIPTIONS[name]
+    entry = TASK_DEFAULTS.get(name)
+    if entry and entry[1]:
+        return entry[1]
     if name.startswith("pkg-"):
         return "package-installed synocrond task"
     return ""
@@ -216,17 +159,9 @@ def describe_task(name: str) -> str:
 # Small helpers
 # --------------------------------------------------------------------------- #
 
-def run_cmd(args: List[str], check: bool = False) -> subprocess.CompletedProcess:
-    """Run a command, capturing output as text. Never raises unless check=True."""
+def run_cmd(args: List[str]) -> subprocess.CompletedProcess:
     log.debug("exec: %s", " ".join(args))
-    return subprocess.run(args, capture_output=True, universal_newlines=True, check=check)
-
-
-def which_first(candidates: List[str]) -> Optional[str]:
-    for c in candidates:
-        if os.path.isfile(c) and os.access(c, os.X_OK):
-            return c
-    return None
+    return subprocess.run(args, capture_output=True, universal_newlines=True)
 
 
 def backup_file(path: str) -> None:
@@ -238,8 +173,7 @@ def backup_file(path: str) -> None:
         os.makedirs(BACKUP_DIR, exist_ok=True)
         if not os.path.exists(path):
             return
-        dest_name = path.replace(os.sep, "/").strip("/").replace("/", "_")
-        dest = os.path.join(BACKUP_DIR, dest_name)
+        dest = os.path.join(BACKUP_DIR, path.replace(os.sep, "/").strip("/").replace("/", "_"))
         if not os.path.exists(dest):
             shutil.copy2(path, dest)
     except Exception as e:
@@ -260,13 +194,6 @@ def syno_set_key_value(conf_file: str, key: str, value: str) -> bool:
     except Exception:
         log.warning("failed to set %s=%s in %s", key, value, conf_file)
         return False
-
-
-def notify_user(title: str, message: str) -> None:
-    """Make a failure loud in the log. (No DSM popup: the notification templates
-    are fragile and firing the wrong one is worse than none. Users check via
-    --status / --diagnose.)"""
-    log.error("!!! %s: %s", title, message)
 
 
 # --------------------------------------------------------------------------- #
@@ -335,8 +262,6 @@ def _build_replacement(segments: List[Segment], groups: Tuple[bytes, ...]) -> by
             out += groups[k - 1]
     return bytes(out)
 
-
-# ---- the actual patch definitions ---------------------------------------- #
 
 SCEMD_TARGET = PatchTarget("scemd", SCEMD_PATH, [
     PatchVariant(
@@ -413,9 +338,8 @@ def parse_elf_load_segments(data: bytes) -> List[ElfSegment]:
     segs: List[ElfSegment] = []
     for i in range(e_phnum):
         off = e_phoff + i * e_phentsize
-        p_type = struct.unpack_from("<I", data, off)[0]
-        if p_type == 1:  # PT_LOAD
-            p_offset, p_vaddr = struct.unpack_from("<QQ", data, off + 8)[0:2]
+        if struct.unpack_from("<I", data, off)[0] == 1:  # PT_LOAD
+            p_offset, p_vaddr = struct.unpack_from("<QQ", data, off + 8)
             p_filesz = struct.unpack_from("<Q", data, off + 32)[0]
             segs.append(ElfSegment(p_offset, p_vaddr, p_filesz))
     return segs
@@ -476,72 +400,71 @@ def compute_changelist(binary_path: str, variant: PatchVariant) -> Optional[List
     return changes
 
 
-# ---- low-level process memory access ------------------------------------- #
+# ---- process memory access via /proc/<pid>/mem --------------------------- #
+#
+# Reads use /proc/pid/mem directly (root can read a running process). Writes to
+# read-only code pages are done through /proc/pid/mem too, which the kernel allows
+# while the target is ptrace-stopped (the same FOLL_FORCE path debuggers use) --
+# so we only need libc ptrace for ATTACH/DETACH, not the old PEEK/POKE word loop.
 
-PTRACE_PEEKDATA = 2
-PTRACE_POKEDATA = 5
-PTRACE_ATTACH = 16
-PTRACE_DETACH = 17
-
-
-class iovec(Structure):
-    _fields_ = [("iov_base", c_void_p), ("iov_len", c_size_t)]
+PTRACE_ATTACH, PTRACE_DETACH = 16, 17
 
 
-class _Libc:
+class Ptrace:
     def __init__(self) -> None:
-        self.libc = CDLL("libc.so.6", use_errno=True)
-        self.libc.process_vm_readv.argtypes = [c_uint64, POINTER(iovec), c_ulong, POINTER(iovec), c_ulong, c_ulong]
-        self.libc.process_vm_readv.restype = c_ssize_t
-        self.libc.ptrace.argtypes = [c_uint64, c_uint64, c_void_p, c_void_p]
-        self.libc.ptrace.restype = c_uint64
+        self.libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        self.libc.ptrace.argtypes = [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_void_p]
+        self.libc.ptrace.restype = ctypes.c_uint64
 
-    def read_mem(self, pid: int, addr: int, length: int) -> Optional[bytes]:
-        buf = create_string_buffer(length)
-        local = iovec(cast(buf, c_void_p), length)
-        remote = iovec(c_void_p(addr), length)
-        ret = self.libc.process_vm_readv(pid, ctypes.byref(local), 1, ctypes.byref(remote), 1, 0)
-        if ret != length:
-            log.error("process_vm_readv(pid=%d, addr=%#x, len=%d) -> %d (%s)",
-                      pid, addr, length, ret, os.strerror(ctypes.get_errno()))
-            return None
-        return buf.raw
-
-    def write_mem(self, pid: int, writes: List[Tuple[int, bytes]]) -> bool:
-        """Write via ptrace POKEDATA (process_vm_writev cannot write RO code pages)."""
+    def attach(self, pid: int) -> bool:
         if self.libc.ptrace(PTRACE_ATTACH, pid, None, None) != 0:
-            log.error("ptrace ATTACH failed for pid %d", pid)
+            log.error("ptrace ATTACH failed for pid %d: %s", pid, os.strerror(ctypes.get_errno()))
             return False
-        try:
-            _, status = os.waitpid(pid, 0)
-            if not (os.WIFSTOPPED(status) and os.WSTOPSIG(status) == signal.SIGSTOP):
-                log.error("unexpected stop status %#x for pid %d", status, pid)
-                return False
+        _, status = os.waitpid(pid, 0)
+        if not os.WIFSTOPPED(status):
+            log.error("pid %d did not stop after ATTACH (status %#x)", pid, status)
+            self.detach(pid)
+            return False
+        return True
 
-            ok = True
-            for addr, payload in writes:
-                for off in range(0, len(payload), 8):
-                    word_addr = addr + off
-                    chunk = payload[off:off + 8]
-                    if len(chunk) < 8:  # need the surrounding bytes to preserve the rest of the word
-                        ctypes.set_errno(0)
-                        old = self.libc.ptrace(PTRACE_PEEKDATA, pid, c_void_p(word_addr), None)
-                        eno = ctypes.get_errno()
-                        if eno != 0:
-                            log.error("ptrace PEEKDATA failed at %#x (pid %d): %s", word_addr, pid, os.strerror(eno))
-                            ok = False
-                            break
-                        chunk = chunk + struct.pack("<Q", old)[len(chunk):]
-                    val = struct.unpack("<Q", chunk)[0]
-                    if self.libc.ptrace(PTRACE_POKEDATA, pid, c_void_p(word_addr), c_void_p(val)) != 0:
-                        log.error("ptrace POKEDATA failed at %#x (pid %d)", word_addr, pid)
-                        ok = False
-                        break
-                if not ok:
-                    break
-            return ok
+    def detach(self, pid: int) -> None:
+        self.libc.ptrace(PTRACE_DETACH, pid, None, None)
+
+
+def read_mem(pid: int, addr: int, length: int) -> Optional[bytes]:
+    try:
+        fd = os.open("/proc/%d/mem" % pid, os.O_RDONLY)
+        try:
+            return os.pread(fd, length, addr)
         finally:
-            self.libc.ptrace(PTRACE_DETACH, pid, None, None)
+            os.close(fd)
+    except OSError as e:
+        log.error("read /proc/%d/mem @ %#x failed: %s", pid, addr, e)
+        return None
+
+
+def write_mem(pid: int, writes: List[Tuple[int, bytes]]) -> bool:
+    """Write (addr, bytes) pairs and read each back to verify. Caller must have the
+    target ptrace-stopped so writes to read-only code pages are permitted."""
+    try:
+        fd = os.open("/proc/%d/mem" % pid, os.O_RDWR)
+    except OSError as e:
+        log.error("open /proc/%d/mem (rw) failed: %s", pid, e)
+        return False
+    try:
+        for addr, data in writes:
+            if os.pwrite(fd, data, addr) != len(data):
+                log.error("pwrite to %#x (pid %d) was short", addr, pid)
+                return False
+            if os.pread(fd, len(data), addr) != data:
+                log.error("read-back mismatch at %#x (pid %d)", addr, pid)
+                return False
+        return True
+    except OSError as e:
+        log.error("write /proc/%d/mem failed: %s", pid, e)
+        return False
+    finally:
+        os.close(fd)
 
 
 def get_pid_by_name(name: str) -> Optional[int]:
@@ -555,7 +478,7 @@ def get_module_base(pid: int, module_name: str) -> Optional[int]:
     """Load bias of the module: the vaddr at which file offset 0 is mapped."""
     line_re = re.compile(r"^([\da-f]+)-([\da-f]+)\s+\S+\s+([\da-f]+)\s+\S+\s+\d+\s+(.*)$")
     try:
-        with open(f"/proc/{pid}/maps") as f:
+        with open("/proc/%d/maps" % pid) as f:
             for line in f:
                 m = line_re.match(line.rstrip("\n"))
                 if not m:
@@ -577,94 +500,90 @@ class PatchOutcome:
     error: Optional[str] = None
 
 
-def apply_target(libc: _Libc, target: PatchTarget) -> PatchOutcome:
-    out = PatchOutcome(target=target.process_name)
-
+def resolve_sites(target: PatchTarget):
+    """Return (pid, variant_name, sites, error) where sites = [(runtime_addr, orig, new)].
+    Shared by apply_target (writes) and cmd_status (read-only report)."""
     pid = get_pid_by_name(target.process_name)
     if not pid:
-        out.error = f"process '{target.process_name}' not running"
-        log.error(out.error)
-        return out
-
+        return None, None, None, "process '%s' not running" % target.process_name
     module = os.path.basename(target.binary_path)
     base = get_module_base(pid, module)
     if base is None:
-        out.error = f"could not find module base of {module} in pid {pid}"
-        log.error(out.error)
-        return out
-
+        return pid, None, None, "could not find module base of %s in pid %d" % (module, pid)
     try:
         segs = parse_elf_load_segments(open(target.binary_path, "rb").read())
     except Exception as e:
-        out.error = f"cannot parse ELF {target.binary_path}: {e}"
-        log.error(out.error)
-        return out
-
+        return pid, None, None, "cannot parse ELF %s: %s" % (target.binary_path, e)
     for variant in target.variants:
         changes = compute_changelist(target.binary_path, variant)
         if not changes:
             continue
-        out.matched_variant = variant.name
-
-        # Resolve each change's file offset to a runtime address.
-        reads: List[Tuple[int, int]] = []
+        sites = []
         for ch in changes:
             vaddr = file_offset_to_vaddr(segs, ch.file_offset)
             if vaddr is None:
-                out.error = f"file offset {ch.file_offset:#x} not in any PT_LOAD segment"
-                log.error(out.error)
-                return out
-            reads.append((base + vaddr, len(ch.orig)))
+                return pid, variant.name, None, "file offset %#x not in any PT_LOAD segment" % ch.file_offset
+            sites.append((base + vaddr, ch.orig, ch.new))
+        return pid, variant.name, sites, None
+    return pid, None, None, "no known patch pattern matched the current binary"
 
-        current = [libc.read_mem(pid, addr, ln) for addr, ln in reads]
-        if any(c is None for c in current):
-            out.error = "failed reading target process memory"
-            return out
 
-        if all(current[i] == changes[i].new for i in range(len(changes))):
-            out.already_patched = True
-            log.info("%s: already patched in memory (%s)", target.process_name, variant.name)
-            return out
-
-        if not all(current[i] == changes[i].orig for i in range(len(changes))):
-            out.error = "memory content does not match expected original bytes"
-            log.error("%s: %s", target.process_name, out.error)
-            return out
-
-        writes = [(reads[i][0], changes[i].new) for i in range(len(changes))]
-        if libc.write_mem(pid, writes):
-            out.applied = True
-            log.info("%s: applied in-memory patch (%s)", target.process_name, variant.name)
-        else:
-            out.error = "ptrace write failed"
+def apply_target(ptrace: Ptrace, target: PatchTarget) -> PatchOutcome:
+    out = PatchOutcome(target=target.process_name)
+    pid, variant, sites, error = resolve_sites(target)
+    out.matched_variant = variant
+    if error:
+        out.error = error
+        log.error("%s: %s", target.process_name, error)
         return out
 
-    out.error = "no known patch pattern matched the current binary"
-    log.error("%s: %s (%s) -- DSM may have changed this binary; run --diagnose",
-              target.process_name, out.error, target.binary_path)
+    current = [read_mem(pid, addr, len(orig)) for addr, orig, _new in sites]
+    if any(c is None for c in current):
+        out.error = "failed reading target process memory"
+        return out
+    if all(current[i] == sites[i][2] for i in range(len(sites))):
+        out.already_patched = True
+        log.info("%s: already patched in memory (%s)", target.process_name, variant)
+        return out
+    if not all(current[i] == sites[i][1] for i in range(len(sites))):
+        out.error = "memory content does not match expected original bytes"
+        log.error("%s: %s", target.process_name, out.error)
+        return out
+
+    if not ptrace.attach(pid):
+        out.error = "ptrace attach failed"
+        return out
+    try:
+        if write_mem(pid, [(addr, new) for addr, _orig, new in sites]):
+            out.applied = True
+            log.info("%s: applied in-memory patch (%s)", target.process_name, variant)
+        else:
+            out.error = "memory write failed"
+    finally:
+        ptrace.detach(pid)
     return out
 
 
 def do_in_memory_fixes() -> bool:
     try:
-        libc = _Libc()
+        ptrace = Ptrace()
     except Exception as e:
-        log.error("failed to initialise libc bindings: %s", e)
+        log.error("failed to initialise ptrace/libc bindings: %s", e)
         return False
 
     all_ok = True
     unmatched = []
     for target in PATCH_TARGETS:
-        outcome = apply_target(libc, target)
+        outcome = apply_target(ptrace, target)
         if outcome.error and not outcome.already_patched:
             all_ok = False
             if outcome.matched_variant is None:
                 unmatched.append(target.binary_path)
 
     if unmatched:
-        notify_user("HDD Hibernation Fixer",
-                    "The NVMe hibernation patch no longer matches these DSM binaries: "
-                    + ", ".join(unmatched) + ". Run 'hiber_fixer.py --diagnose'.")
+        # Loud so a future DSM that changes these binaries is visible, not a silent no-op.
+        log.error("!!! NVMe hibernation patch no longer matches %s -- run 'hiber_fixer.py --diagnose'",
+                  ", ".join(unmatched))
     return all_ok
 
 
@@ -702,21 +621,14 @@ def load_task_file(path: str) -> List[SynocrondTask]:
         obj = json.load(f)
     entries = obj if isinstance(obj, list) else [obj]
 
-    fname = os.path.basename(path)
-    if "." in fname:
-        fname = fname.split(".")[0]
-
+    fname = os.path.basename(path).split(".")[0]
     # Package tasks (under /usr/local/etc/synocron.d) are named pkg-<file>-<name> at
     # runtime; built-in ones (share/ and etc/) use the builtin- prefix.
-    norm = path.replace(os.sep, "/")
-    prefix = "pkg-" if "/usr/local/etc/synocron.d/" in norm else "builtin-"
+    prefix = "pkg-" if "/usr/local/etc/synocron.d/" in path.replace(os.sep, "/") else "builtin-"
 
     tasks = []
     for entry in entries:
-        if "name" in entry:
-            name = prefix + fname + "-" + entry["name"]
-        else:
-            name = prefix + fname + "-default"
+        name = prefix + fname + "-" + (entry["name"] if "name" in entry else "default")
         tasks.append(SynocrondTask(name, entry))
     return tasks
 
@@ -724,7 +636,7 @@ def load_task_file(path: str) -> List[SynocrondTask]:
 def task_period(body: dict) -> str:
     period = body.get("period", "?")
     if period == "crontab" and "crontab" in body:
-        period += f" ({body['crontab']})"
+        period += " (%s)" % body["crontab"]
     return period
 
 
@@ -743,21 +655,20 @@ def load_synocrond_config() -> Optional[dict]:
         return None
 
 
-def discover_tasks() -> Dict[str, Tuple[str, str]]:
-    """Return {task_name: (current_period, description)} across task files and the live config."""
-    result: Dict[str, Tuple[str, str]] = {}
+def discover_tasks() -> Dict[str, str]:
+    """Return {task_name: current_period} across task files and the live synocrond.config."""
+    result: Dict[str, str] = {}
     for path in enumerate_task_files():
         try:
             for t in load_task_file(path):
-                result[t.name] = (task_period(t.body), describe_task(t.name))
+                result[t.name] = task_period(t.body)
         except Exception as e:
             log.warning("skipping task file %s: %s", path, e)
 
     cfg = load_synocrond_config()
     if cfg:
         for job_name, job in cfg.get("jobs", {}).items():
-            name = clean_job_name(job_name)
-            result[name] = (task_period(job.get("config", {})), describe_task(name))
+            result[clean_job_name(job_name)] = task_period(job.get("config", {}))
     return result
 
 
@@ -868,14 +779,17 @@ def apply_config_to_synocrond_config(actions: Dict[str, str]) -> bool:
 # 3) noatime + 4) synocached fixes
 # --------------------------------------------------------------------------- #
 
-def remount_root_noatime() -> None:
+def root_is_noatime() -> bool:
     try:
         out = subprocess.check_output(["mount"], universal_newlines=True)
-        for line in out.splitlines():
-            if " / " in line and "md0" in line and "noatime" in line:
-                return  # already noatime
+        return any(" / " in l and "md0" in l and "noatime" in l for l in out.splitlines())
     except Exception:
-        pass
+        return False
+
+
+def remount_root_noatime() -> None:
+    if root_is_noatime():
+        return
     rc = subprocess.call(["mount", "-o", "noatime,remount", "/"],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if rc:
@@ -917,7 +831,6 @@ def _load_volume_names() -> Dict[str, str]:
 
 def find_relatime_volumes() -> List[Tuple[str, str]]:
     """Return [(uuid, display_name)] for volumes whose atime_opt != noatime."""
-    import configparser
     names = _load_volume_names()
     result: List[Tuple[str, str]] = []
     try:
@@ -932,7 +845,6 @@ def find_relatime_volumes() -> List[Tuple[str, str]]:
 
 
 def set_volumes_noatime() -> bool:
-    import configparser
     bad = find_relatime_volumes()
     if not bad:
         return True
@@ -962,14 +874,10 @@ def config_path_for(script_path: str) -> str:
 
 def default_config() -> dict:
     tasks = {}
-    discovered = discover_tasks()
-    for name in sorted(set(discovered) | set(DEFAULT_TASK_ACTIONS)):
+    discovered = set(discover_tasks())
+    for name in sorted(discovered | set(DEFAULT_TASK_ACTIONS)):
         tasks[name] = DEFAULT_TASK_ACTIONS.get(name, "unchanged")
-    return {
-        "_comment": "Actions: unchanged|hourly|daily|weekly|monthly|delete. Edit, then re-run --run.",
-        "fixes": dict(DEFAULT_FIXES),
-        "synocrond_tasks": tasks,
-    }
+    return {"_comment": CONFIG_COMMENT, "fixes": dict(DEFAULT_FIXES), "synocrond_tasks": tasks}
 
 
 def load_config(path: str) -> dict:
@@ -993,8 +901,7 @@ def load_config(path: str) -> dict:
     if added and os.path.exists(path):
         log.info("config: %d newly-discovered task(s) added with default actions", added)
 
-    return {"_comment": cfg.get("_comment", default_config()["_comment"]),
-            "fixes": fixes, "synocrond_tasks": tasks}
+    return {"_comment": cfg.get("_comment", CONFIG_COMMENT), "fixes": fixes, "synocrond_tasks": tasks}
 
 
 def save_config(path: str, cfg: dict) -> None:
@@ -1007,7 +914,10 @@ def save_config(path: str, cfg: dict) -> None:
 # --------------------------------------------------------------------------- #
 
 def esynoscheduler() -> Optional[str]:
-    return which_first(ESYNOSCHEDULER_CANDIDATES)
+    for c in ESYNOSCHEDULER_CANDIDATES:
+        if os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    return None
 
 
 def scheduler_list_raw() -> str:
@@ -1047,8 +957,8 @@ def create_boot_task(operation: str) -> bool:
     if not tool:
         log.error("esynoscheduler not found")
         return False
-    args = [tool, "--create", f"task_name={TASK_NAME}", "event=bootup", "enable=true",
-            "operation_type=script", f"operation={operation}",
+    args = [tool, "--create", "task_name=%s" % TASK_NAME, "event=bootup", "enable=true",
+            "operation_type=script", "operation=%s" % operation,
             "description=HDD hibernation fixer (runs hiber_fixer.py at boot)",
             r'owner={"0":"root"}']
     try:
@@ -1064,7 +974,7 @@ def delete_boot_task() -> bool:
     if not tool:
         return False
     try:
-        out = subprocess.check_output([tool, "--delete", f"task_name={TASK_NAME}"],
+        out = subprocess.check_output([tool, "--delete", "task_name=%s" % TASK_NAME],
                                       stderr=subprocess.STDOUT).decode("utf-8", "replace")
         return "delete task ok" in out
     except Exception:
@@ -1084,28 +994,29 @@ def system_running() -> bool:
         return True  # don't block if systemd query fails
 
 
-def wait_for_system(timeout: int = BOOT_WAIT_TIMEOUT) -> bool:
-    """Wait until systemd reports the boot has finished (running/degraded)."""
+def wait_until(predicate, timeout: int, on_timeout=None) -> bool:
     deadline = time.time() + timeout
-    while not system_running():
+    while not predicate():
         if time.time() >= deadline:
-            log.warning("system did not finish booting within %ds; continuing anyway", timeout)
+            if on_timeout:
+                on_timeout()
             return False
         time.sleep(2)
     return True
 
 
+def wait_for_system(timeout: int = BOOT_WAIT_TIMEOUT) -> bool:
+    """Wait until systemd reports the boot has finished (running/degraded)."""
+    return wait_until(system_running, timeout,
+                      lambda: log.warning("system did not finish booting within %ds; continuing anyway", timeout))
+
+
 def wait_for_daemons(timeout: int = BOOT_WAIT_TIMEOUT) -> bool:
     """Wait until the in-memory patch targets (scemd, synostgd-disk) are running."""
-    deadline = time.time() + timeout
-    while True:
-        missing = [t.process_name for t in PATCH_TARGETS if not get_pid_by_name(t.process_name)]
-        if not missing:
-            return True
-        if time.time() >= deadline:
-            log.error("patch target daemon(s) not running within %ds: %s", timeout, ", ".join(missing))
-            return False
-        time.sleep(2)
+    def missing():
+        return [t.process_name for t in PATCH_TARGETS if not get_pid_by_name(t.process_name)]
+    return wait_until(lambda: not missing(), timeout,
+                      lambda: log.error("patch target daemon(s) not running within %ds: %s", timeout, ", ".join(missing())))
 
 
 # --------------------------------------------------------------------------- #
@@ -1153,75 +1064,77 @@ def cmd_install(script_path: str, install_dir: str) -> int:
     src = os.path.abspath(script_path)
     if src != installed_script:
         shutil.copy2(src, installed_script)
-        print(f"Installed script to {installed_script}")
+        print("Installed script to %s" % installed_script)
     else:
-        print(f"Running from install location {installed_script}")
+        print("Running from install location %s" % installed_script)
 
     config_path = os.path.join(install_dir, CONFIG_BASENAME)
     if not os.path.exists(config_path):
         save_config(config_path, default_config())
-        print(f"Wrote default config to {config_path}")
+        print("Wrote default config to %s" % config_path)
         print("  Review/edit it to choose what to do with each synocrond task, then re-run --run if needed.")
     else:
-        # merge in any new tasks
-        save_config(config_path, load_config(config_path))
-        print(f"Kept existing config {config_path}")
+        save_config(config_path, load_config(config_path))   # merge in newly discovered tasks
+        print("Kept existing config %s" % config_path)
 
-    operation = f"{PYTHON} {installed_script} --run"
+    operation = "%s %s --run" % (PYTHON, installed_script)
     delete_boot_task()
     if not create_boot_task(operation):
         print("ERROR: failed to create the boot-up Task Scheduler task")
         return 1
-    print(f'Created boot-up task "{TASK_NAME}" -> {operation}')
+    print('Created boot-up task "%s" -> %s' % (TASK_NAME, operation))
 
     print("\nApplying fixes now...")
     rc = cmd_run(config_path, wait=False)
     print("\nInstallation complete. The fixes will re-apply automatically on every boot.")
-    print(f"You can delete the copy you ran --install from; the active copy lives in {install_dir}.")
+    print("You can delete the copy you ran --install from; the active copy lives in %s." % install_dir)
     return rc
 
 
 def cmd_uninstall(script_path: str, purge: bool) -> int:
     if delete_boot_task():
-        print(f'Removed the "{TASK_NAME}" boot task.')
+        print('Removed the "%s" boot task.' % TASK_NAME)
     else:
-        print(f'Could not remove the "{TASK_NAME}" boot task (maybe already gone).')
+        print('Could not remove the "%s" boot task (maybe already gone).' % TASK_NAME)
     print("The in-memory NVMe patch is not persistent; reboot to fully revert it.")
     if purge:
         install_dir = os.path.dirname(os.path.abspath(script_path))
-        print(f"--purge: leaving {install_dir} in place; delete it manually if you want.")
-        print(f"Backups of modified config files are in {BACKUP_DIR}.")
+        print("--purge: leaving %s in place; delete it manually if you want." % install_dir)
+        print("Backups of modified config files are in %s." % BACKUP_DIR)
     return 0
 
 
+def _status_report_target(target: PatchTarget) -> None:
+    pid, variant, sites, error = resolve_sites(target)
+    if sites is None:
+        print("  %s: %s" % (target.process_name, error))
+        return
+    states = []
+    for addr, orig, new in sites:
+        cur = read_mem(pid, addr, len(orig))
+        states.append("patched" if cur == new else "original" if cur == orig else "unknown")
+    verdict = "PATCHED" if all(s == "patched" for s in states) else \
+              "not patched" if all(s == "original" for s in states) else "partial/unknown"
+    print("  %s: %s (matched %s)" % (target.process_name, verdict, variant))
+
+
 def cmd_status(config_path: str) -> int:
-    print(f"== HDD Hibernation Fixer status ==\n")
+    print("== HDD Hibernation Fixer status ==\n")
 
     state = scheduler_task_state(TASK_NAME)
     if state is None:
-        print(f'Boot task "{TASK_NAME}": NOT INSTALLED')
+        print('Boot task "%s": NOT INSTALLED' % TASK_NAME)
     else:
-        print(f'Boot task "{TASK_NAME}": {"ENABLED" if state else "DISABLED (re-enable it or re-run --install)"}')
+        print('Boot task "%s": %s' % (TASK_NAME, "ENABLED" if state else "DISABLED (re-enable it or re-run --install)"))
 
     print("\nIn-memory NVMe patch (current process state):")
-    try:
-        libc = _Libc()
-    except Exception as e:
-        libc = None
-        print(f"  (cannot read process memory: {e})")
-    if libc:
-        for target in PATCH_TARGETS:
-            _status_report_target(libc, target)
+    for target in PATCH_TARGETS:
+        _status_report_target(target)
 
     print("\nnoatime:")
-    try:
-        mounts = subprocess.check_output(["mount"], universal_newlines=True)
-        root_noatime = any(" / " in l and "md0" in l and "noatime" in l for l in mounts.splitlines())
-        print(f"  root (/) noatime: {'yes' if root_noatime else 'NO'}")
-    except Exception:
-        print("  root (/) noatime: unknown")
+    print("  root (/) noatime: %s" % ("yes" if root_is_noatime() else "NO"))
     relatime = find_relatime_volumes()
-    print(f"  volumes on relatime: {', '.join(n for _u, n in relatime) if relatime else 'none'}")
+    print("  volumes on relatime: %s" % (", ".join(n for _u, n in relatime) if relatime else "none"))
 
     print("\nsynocached idle timeout:")
     conf = os.path.join(SYNOCACHED_DIR, "synocached.conf")
@@ -1232,55 +1145,20 @@ def cmd_status(config_path: str) -> int:
                 for line in f:
                     if line.startswith("timeout"):
                         val = line.split()[1]
-            print(f"  {conf}: timeout {val}")
+            print("  %s: timeout %s" % (conf, val))
         except Exception:
-            print(f"  {conf}: unreadable")
+            print("  %s: unreadable" % conf)
 
     if os.path.exists(config_path):
         cfg = load_config(config_path)
         acts = cfg["synocrond_tasks"]
         changed = {k: v for k, v in acts.items() if v != "unchanged"}
-        print(f"\nConfig: {config_path}")
-        print(f"  fixes: {cfg['fixes']}")
-        print(f"  synocrond tasks: {len(acts)} known, {len(changed)} set to change")
+        print("\nConfig: %s" % config_path)
+        print("  fixes: %s" % cfg["fixes"])
+        print("  synocrond tasks: %d known, %d set to change" % (len(acts), len(changed)))
     else:
-        print(f"\nConfig: not found at {config_path}")
+        print("\nConfig: not found at %s" % config_path)
     return 0
-
-
-def _status_report_target(libc: _Libc, target: PatchTarget) -> None:
-    pid = get_pid_by_name(target.process_name)
-    if not pid:
-        print(f"  {target.process_name}: not running")
-        return
-    base = get_module_base(pid, os.path.basename(target.binary_path))
-    if base is None:
-        print(f"  {target.process_name}: module base not found")
-        return
-    try:
-        segs = parse_elf_load_segments(open(target.binary_path, "rb").read())
-    except Exception as e:
-        print(f"  {target.process_name}: cannot parse binary ({e})")
-        return
-    for variant in target.variants:
-        changes = compute_changelist(target.binary_path, variant)
-        if not changes:
-            continue
-        states = []
-        for ch in changes:
-            vaddr = file_offset_to_vaddr(segs, ch.file_offset)
-            cur = libc.read_mem(pid, base + vaddr, len(ch.orig)) if vaddr is not None else None
-            if cur == ch.new:
-                states.append("patched")
-            elif cur == ch.orig:
-                states.append("original")
-            else:
-                states.append("unknown")
-        verdict = "PATCHED" if all(s == "patched" for s in states) else \
-                  "not patched" if all(s == "original" for s in states) else "partial/unknown"
-        print(f"  {target.process_name}: {verdict} (matched {variant.name})")
-        return
-    print(f"  {target.process_name}: NO PATTERN MATCH -- binary changed; run --diagnose")
 
 
 def cmd_diagnose() -> int:
@@ -1288,25 +1166,24 @@ def cmd_diagnose() -> int:
     if nothing matches (useful to regenerate patterns after a DSM update)."""
     print("== diagnose ==")
     for target in PATCH_TARGETS:
-        print(f"\n{target.binary_path} (process {target.process_name}):")
+        print("\n%s (process %s):" % (target.binary_path, target.process_name))
         if not os.path.exists(target.binary_path):
             print("  binary not found")
             continue
         data = open(target.binary_path, "rb").read()
         matched = False
         for variant in target.variants:
-            rx = _compile_search(variant.search)
-            hits = list(rx.finditer(data))
-            print(f"  variant '{variant.name}': {len(hits)} match(es)"
-                  + (f" at {hits[0].start():#x}" if hits else ""))
+            hits = list(_compile_search(variant.search).finditer(data))
+            print("  variant '%s': %d match(es)%s"
+                  % (variant.name, len(hits), (" at %#x" % hits[0].start()) if hits else ""))
             matched = matched or bool(hits)
         if not matched:
             print("  no variant matched -- scanning for candidate 'mov edi,7; call' sites:")
-            for off in [m.start() for m in re.finditer(re.escape(b"\xBF\x07\x00\x00\x00\xE8"), data)]:
+            for m in re.finditer(re.escape(b"\xBF\x07\x00\x00\x00\xE8"), data):
+                off = m.start()
                 ctx = data[max(0, off - 24):off + 16]
                 if b"\xBF\x01" in ctx or b"\xBF\x03" in ctx:
-                    lo = max(0, off - 24)
-                    print(f"    off {off:#x}: ...{data[lo:off + 32].hex()}...")
+                    print("    off %#x: ...%s..." % (off, data[max(0, off - 24):off + 32].hex()))
             print("  Send this output to regenerate the patterns for your DSM build.")
     return 0
 
@@ -1323,12 +1200,13 @@ def cmd_configure(config_path: str) -> int:
     letter = {"u": "unchanged", "h": "hourly", "d": "daily", "w": "weekly", "m": "monthly", "x": "delete"}
     try:
         for i, name in enumerate(names, 1):
-            cur_period, descr = discovered.get(name, ("(not present)", describe_task(name)))
+            cur_period = discovered.get(name, "(not present)")
+            descr = describe_task(name)
             default = actions.get(name, "unchanged")
-            print(f"[{i}/{len(names)}] {name}")
+            print("[%d/%d] %s" % (i, len(names), name))
             if descr:
-                print(f"     {descr}")
-            print(f"     current interval: {cur_period}   default action: {default}")
+                print("     %s" % descr)
+            print("     current interval: %s   default action: %s" % (cur_period, default))
             while True:
                 ch = input("     action [u/h/d/w/m/x]: ").strip().lower()
                 if not ch:
@@ -1344,7 +1222,7 @@ def cmd_configure(config_path: str) -> int:
 
     cfg["synocrond_tasks"] = actions
     save_config(config_path, cfg)
-    print(f"Saved {config_path}")
+    print("Saved %s" % config_path)
     return 0
 
 
@@ -1371,7 +1249,7 @@ def preflight(require_root: bool = True) -> Optional[str]:
         return "Only x86_64-based NAS models are supported."
     major = syno_get_key_value(VERSION_PATH, "majorversion")
     if major and major != "7":
-        return f"This script targets DSM 7 (found major version {major})."
+        return "This script targets DSM 7 (found major version %s)." % major
     if require_root and hasattr(os, "geteuid") and os.geteuid() != 0:
         return "Please run with root privileges (sudo)."
     return None
@@ -1386,7 +1264,7 @@ def main(argv: List[str]) -> int:
     g.add_argument("--status", action="store_true", help="show current state")
     g.add_argument("--diagnose", action="store_true", help="dump patch-site info")
     g.add_argument("--configure", action="store_true", help="interactively edit the config")
-    parser.add_argument("--install-dir", default=DEFAULT_INSTALL_DIR, help=f"install location (default {DEFAULT_INSTALL_DIR})")
+    parser.add_argument("--install-dir", default=DEFAULT_INSTALL_DIR, help="install location (default %s)" % DEFAULT_INSTALL_DIR)
     parser.add_argument("--config", default=None, help="path to config file (default: next to the script)")
     parser.add_argument("--purge", action="store_true", help="with --uninstall: also report leftover files/backups")
     parser.add_argument("-v", "--verbose", action="store_true", help="verbose console output")
@@ -1397,7 +1275,7 @@ def main(argv: List[str]) -> int:
     need_root = not (args.status or args.diagnose)
     err = preflight(require_root=need_root)
     if err:
-        print(f"ERROR: {err}")
+        print("ERROR: %s" % err)
         return 1
 
     script_path = os.path.abspath(sys.argv[0])
