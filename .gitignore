@@ -162,3 +162,6 @@ cython_debug/
 # Local research: DSM binaries (Synology proprietary — do not redistribute) and
 # config captures containing personal data. Kept locally, never committed.
 research/
+
+# Runtime config written next to the installed script (per-machine state, not source).
+hiber_fixer.config.json
