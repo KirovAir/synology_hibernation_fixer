@@ -54,6 +54,7 @@ python3 hiber_fixer.py --run         # apply everything now (what the boot task 
 python3 hiber_fixer.py --status      # show current state (task, patch, noatime, config)
 python3 hiber_fixer.py --configure   # interactively edit which jobs to slow down / delete
 python3 hiber_fixer.py --diagnose    # dump patch-site info (use if a DSM update breaks the patch)
+python3 hiber_fixer.py --restore     # undo the synocrond/synocached/volume changes (from /var/synobackup)
 python3 hiber_fixer.py --uninstall   # remove the boot task
 ```
 

@@ -16,7 +16,7 @@ script -- no compressed copy embedded in the task. Both survive DSM upgrades.
 
     sudo python3 hiber_fixer.py --install [--install-dir DIR]
     sudo python3 hiber_fixer.py --run | --status | --diagnose | --configure
-    sudo python3 hiber_fixer.py --uninstall [--purge]
+    sudo python3 hiber_fixer.py --uninstall [--purge] | --restore
 """
 
 from __future__ import annotations
@@ -48,6 +48,7 @@ CONFIG_BASENAME = "hiber_fixer.config.json"
 CONFIG_COMMENT = "Actions: unchanged|hourly|daily|weekly|monthly|delete. Edit, then re-run --run."
 LOG_PATH = "/var/log/hibernation_fixer.log"
 BACKUP_DIR = "/var/synobackup"
+BACKUP_MANIFEST = "/var/synobackup/hiber_fixer_manifest.json"
 
 PYTHON = "/usr/bin/python3"
 
@@ -164,18 +165,43 @@ def run_cmd(args: List[str]) -> subprocess.CompletedProcess:
     return subprocess.run(args, capture_output=True, universal_newlines=True)
 
 
-def backup_file(path: str) -> None:
-    """Back up a file into BACKUP_DIR before we modify it (best effort).
+def _load_manifest() -> dict:
+    """Manifest recording what the tool changed, so --restore can undo it."""
+    try:
+        with open(BACKUP_MANIFEST) as f:
+            m = json.load(f)
+    except Exception:
+        m = {}
+    m.setdefault("files", {})            # original_path -> backup filename in BACKUP_DIR
+    m.setdefault("synoinfo", {})         # synoinfo.conf key -> original value
+    m.setdefault("services_masked", [])  # systemd units we masked
+    return m
 
-    Backups are namespaced by full path (so same-named files in different dirs don't
-    collide) and the first/pristine copy is kept across re-runs."""
+
+def _save_manifest(m: dict) -> None:
+    try:
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+        with open(BACKUP_MANIFEST, "w") as f:
+            json.dump(m, f, indent=4)
+    except Exception as e:
+        log.warning("could not write backup manifest: %s", e)
+
+
+def backup_file(path: str) -> None:
+    """Back up a file into BACKUP_DIR before we modify it (best effort) and record it in
+    the manifest for --restore. Namespaced by full path; the first (pristine) copy is
+    kept across re-runs."""
     try:
         os.makedirs(BACKUP_DIR, exist_ok=True)
         if not os.path.exists(path):
             return
-        dest = os.path.join(BACKUP_DIR, path.replace(os.sep, "/").strip("/").replace("/", "_"))
-        if not os.path.exists(dest):
-            shutil.copy2(path, dest)
+        dest_name = path.replace(os.sep, "/").strip("/").replace("/", "_")
+        if not os.path.exists(os.path.join(BACKUP_DIR, dest_name)):
+            shutil.copy2(path, os.path.join(BACKUP_DIR, dest_name))
+        m = _load_manifest()
+        if path not in m["files"]:
+            m["files"][path] = dest_name
+            _save_manifest(m)
     except Exception as e:
         log.warning("could not back up %s: %s", path, e)
 
@@ -673,12 +699,24 @@ def discover_tasks() -> Dict[str, str]:
 
 
 def _handle_dyn_task_deletion(name: str) -> None:
-    """Extra work required to keep certain 'dynamic' tasks from coming back."""
+    """Extra work required to keep certain 'dynamic' tasks from coming back.
+    Original state is recorded in the manifest so --restore can undo it."""
     if name == "builtin-dyn-autopkgupgrade-default":
+        m = _load_manifest()
+        dirty = False
         for key in ("pkg_autoupdate_important", "enable_pkg_autoupdate_all", "upgrade_pkg_dsm_notification"):
-            if syno_get_key_value(SYNOINFO_CONF_PATH, key) != "no":
+            cur = syno_get_key_value(SYNOINFO_CONF_PATH, key)
+            if cur != "no":
+                m["synoinfo"].setdefault(key, cur if cur is not None else "")
                 syno_set_key_value(SYNOINFO_CONF_PATH, key, "no")
+                dirty = True
+        if dirty:
+            _save_manifest(m)
     elif name in ("builtin-synodbud-synodbud", "builtin-dyn-synodbud-default"):
+        m = _load_manifest()
+        if "synodbud_autoupdate.service" not in m["services_masked"]:
+            m["services_masked"].append("synodbud_autoupdate.service")
+            _save_manifest(m)
         run_cmd(["systemctl", "mask", "synodbud_autoupdate.service"])
         run_cmd(["systemctl", "stop", "synodbud_autoupdate.service"])
         run_cmd(["synodbud", "-p"])
@@ -1100,7 +1138,62 @@ def cmd_uninstall(script_path: str, purge: bool) -> int:
     if purge:
         install_dir = os.path.dirname(os.path.abspath(script_path))
         print("--purge: leaving %s in place; delete it manually if you want." % install_dir)
-        print("Backups of modified config files are in %s." % BACKUP_DIR)
+        print("Backups of modified config files are in %s (undo them with --restore)." % BACKUP_DIR)
+    return 0
+
+
+def cmd_restore() -> int:
+    """Restore every file the tool backed up (synocrond config/tasks, synocached, volume.conf)
+    to its pristine pre-change content, and undo the recorded synoinfo/service side effects."""
+    m = _load_manifest()
+    files = m.get("files", {})
+    if not files and not m.get("synoinfo") and not m.get("services_masked"):
+        print("Nothing to restore: no changes recorded in %s." % BACKUP_MANIFEST)
+        return 0
+
+    restored, failed = [], []
+    for path, dest_name in files.items():
+        src = os.path.join(BACKUP_DIR, dest_name)
+        if not os.path.exists(src):
+            failed.append("%s (backup %s missing)" % (path, dest_name))
+            continue
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            shutil.copy2(src, path)
+            restored.append(path)
+        except OSError as e:
+            failed.append("%s (%s)" % (path, e))
+
+    for key, val in m.get("synoinfo", {}).items():
+        syno_set_key_value(SYNOINFO_CONF_PATH, key, val)
+    for svc in m.get("services_masked", []):
+        run_cmd(["systemctl", "unmask", svc])
+
+    # Refresh synocrond from the restored config.
+    for p in ("/run/synocrond", "/run/synocrond.st.config", "/run/synocrond.config"):
+        try:
+            if os.path.isdir(p):
+                shutil.rmtree(p)
+            elif os.path.exists(p):
+                os.unlink(p)
+        except OSError:
+            pass
+    subprocess.call(["systemctl", "restart", "synocrond"])
+
+    print("Restored %d file(s) from %s:" % (len(restored), BACKUP_DIR))
+    for p in restored:
+        print("  %s" % p)
+    if m.get("synoinfo"):
+        print("Reverted synoinfo keys: %s" % ", ".join(sorted(m["synoinfo"])))
+    if m.get("services_masked"):
+        print("Unmasked services: %s" % ", ".join(m["services_masked"]))
+    if failed:
+        print("Could NOT restore:")
+        for x in failed:
+            print("  %s" % x)
+    print("\nsynocrond restarted. Reboot to fully apply the restored volume.conf (atime) settings.")
+    print("This puts the config files back but leaves the boot task in place -- it would re-apply the")
+    print("fixes on the next boot. Run --uninstall (and reboot) as well for a permanent revert.")
     return 0
 
 
@@ -1260,6 +1353,7 @@ def main(argv: List[str]) -> int:
     g = parser.add_mutually_exclusive_group(required=True)
     g.add_argument("--install", action="store_true", help="install the boot task and apply fixes")
     g.add_argument("--uninstall", action="store_true", help="remove the boot task")
+    g.add_argument("--restore", action="store_true", help="undo the config changes (from /var/synobackup)")
     g.add_argument("--run", action="store_true", help="apply all fixes now")
     g.add_argument("--status", action="store_true", help="show current state")
     g.add_argument("--diagnose", action="store_true", help="dump patch-site info")
@@ -1285,6 +1379,8 @@ def main(argv: List[str]) -> int:
         return cmd_install(script_path, args.install_dir)
     if args.uninstall:
         return cmd_uninstall(script_path, purge=args.purge)
+    if args.restore:
+        return cmd_restore()
     if args.run:
         return cmd_run(config_path)
     if args.status:
