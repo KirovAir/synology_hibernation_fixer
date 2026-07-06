@@ -71,7 +71,7 @@ directory. Logs go to `/var/log/hibernation_fixer.log`; backups of any modified 
         "nvme_in_memory_patch": true,
         "remount_root_noatime": true,
         "synocached_timeout_900": true,
-        "set_volumes_noatime": false
+        "set_volumes_noatime": true
     },
     "synocrond_tasks": {
         "builtin-synodatacollect-udc": "delete",
@@ -83,8 +83,9 @@ directory. Logs go to `/var/log/hibernation_fixer.log`; backups of any modified 
 
 Each task action is one of `unchanged | hourly | daily | weekly | monthly | delete`. Sensible
 defaults are filled in; edit and re-run `--run`. New tasks introduced by future DSM/package
-updates are added automatically (as `unchanged`) so you can review them. Setting
-`set_volumes_noatime` to `true` will change your data volumes to `noatime` (requires a reboot).
+updates are added automatically (as `unchanged`) so you can review them. `set_volumes_noatime`
+(default `true`) also sets your data volumes to `noatime`, which takes effect on the next reboot;
+set it to `false` to leave volume mount options untouched.
 
 ## How the NVMe patch works (for the curious)
 

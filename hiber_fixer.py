@@ -142,7 +142,7 @@ DEFAULT_FIXES = {
     "nvme_in_memory_patch": True,
     "remount_root_noatime": True,
     "synocached_timeout_900": True,
-    "set_volumes_noatime": False,   # requires a reboot; opt-in only
+    "set_volumes_noatime": True,    # also set data volumes noatime (applies on next reboot)
 }
 
 
