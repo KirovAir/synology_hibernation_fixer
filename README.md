@@ -23,6 +23,8 @@ Applied every time `--run` executes:
    each job is declared in a plain JSON config file — no more baking choices into the source.
 3. **noatime** — remounts `/` `noatime`, and (opt-in) sets data volumes to `noatime`.
 4. **synocached** — lowers the redis/synocached idle timeout from 3600 s to 900 s.
+5. **hibernation debug logger** — turns off DSM's HDD-hibernation wakeup logger, which writes
+   `hibernationFull.log` to the system partition (mirrored onto the HDDs) and keeps them awake.
 
 ## How it persists (what changed vs. the original)
 
@@ -72,7 +74,8 @@ directory. Logs go to `/var/log/hibernation_fixer.log`; backups of any modified 
         "nvme_in_memory_patch": true,
         "remount_root_noatime": true,
         "synocached_timeout_900": true,
-        "set_volumes_noatime": true
+        "set_volumes_noatime": true,
+        "disable_hibernation_debug": true
     },
     "synocrond_tasks": {
         "builtin-synodatacollect-udc": "delete",

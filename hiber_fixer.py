@@ -4,11 +4,12 @@
 Synology DSM HDD hibernation fixer (x86 NAS, DSM 7.0 - 7.3).
 
 Makes the hard drives spin down (hibernate) by removing what keeps waking them.
-`--run` applies four fixes: (1) an in-memory patch of the running scemd / synostgd-disk
+`--run` applies these fixes: (1) an in-memory patch of the running scemd / synostgd-disk
 processes so ongoing NVMe I/O no longer blocks HDD hibernation (reapplied each boot;
 the on-disk binary is never touched), (2) synocrond task tuning driven by an external
-JSON config, (3) noatime for / and (opt-in) data volumes, (4) synocached idle timeout
-3600 -> 900s.
+JSON config, (3) noatime for / and data volumes, (4) synocached idle timeout 3600 -> 900s,
+(5) turning off DSM's HDD-hibernation debug logger (it writes to the HDD system partition
+and keeps the disks awake).
 
 `--install` copies this script to a data volume (default /volume1/hiber_fixer), writes a
 config file beside it, and creates a boot-up Task Scheduler task that just runs this
@@ -60,6 +61,8 @@ VOLUME_CONF_PATH = "/usr/syno/etc/volume.conf"
 SYNOINFO_CONF_PATH = "/etc/synoinfo.conf"
 SYNOCACHED_DIR = "/usr/syno/etc/synocached"
 VERSION_PATH = "/etc.defaults/VERSION"
+SYNO_HIBERNATION_LOG_LEVEL = "/proc/sys/kernel/syno_hibernation_log_level"
+HIBERNATION_DEBUG_SERVICE = "hibernationdebug.service"
 
 SYNOGETKEYVALUE = "/usr/syno/bin/synogetkeyvalue"
 SYNOSETKEYVALUE = "/usr/syno/bin/synosetkeyvalue"
@@ -143,7 +146,8 @@ DEFAULT_FIXES = {
     "nvme_in_memory_patch": True,
     "remount_root_noatime": True,
     "synocached_timeout_900": True,
-    "set_volumes_noatime": True,    # also set data volumes noatime (applies on next reboot)
+    "set_volumes_noatime": True,        # also set data volumes noatime (applies on next reboot)
+    "disable_hibernation_debug": True,  # stop DSM's wakeup logger writing to the HDD system partition
 }
 
 
@@ -854,6 +858,30 @@ def apply_synocached_fix() -> None:
             log.error("cannot update %s: %s", path, e)
 
 
+def apply_hibernation_debug_off() -> None:
+    """Turn off DSM's HDD-hibernation debug logger. It writes /var/log/hibernationFull.log to
+    md0 (the system partition, which is RAID1-mirrored onto the HDDs), so it keeps the disks
+    awake on its own. The synoinfo flag is persistent (recorded in the manifest for --restore);
+    the kernel log level and the service reset on reboot, so we re-apply those on every run."""
+    cur = syno_get_key_value(SYNOINFO_CONF_PATH, "enable_hibernation_debug")
+    if cur == "yes":
+        m = _load_manifest()
+        m["synoinfo"].setdefault("enable_hibernation_debug", cur)
+        _save_manifest(m)
+        syno_set_key_value(SYNOINFO_CONF_PATH, "enable_hibernation_debug", "no")
+        log.info("disabled enable_hibernation_debug (its wakeup log to md0 keeps the HDDs awake)")
+
+    try:
+        if os.path.exists(SYNO_HIBERNATION_LOG_LEVEL):
+            with open(SYNO_HIBERNATION_LOG_LEVEL, "w") as f:
+                f.write("0")
+    except OSError as e:
+        log.warning("could not set %s: %s", SYNO_HIBERNATION_LOG_LEVEL, e)
+
+    subprocess.call(["systemctl", "stop", HIBERNATION_DEBUG_SERVICE],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 def _load_volume_names() -> Dict[str, str]:
     names: Dict[str, str] = {}
     try:
@@ -1081,6 +1109,8 @@ def cmd_run(config_path: str, wait: bool = True) -> int:
     ok = apply_config_to_synocrond_config(actions) and ok
     if fixes.get("synocached_timeout_900", True):
         apply_synocached_fix()
+    if fixes.get("disable_hibernation_debug", True):
+        apply_hibernation_debug_off()
 
     relatime = find_relatime_volumes()
     if relatime:
