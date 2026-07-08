@@ -21,6 +21,7 @@ Each run applies these fixes:
 
 - Stops NVMe activity from keeping the HDDs awake.
 - Stops an SSD used as a data volume in a drive bay from keeping the HDDs awake (off by default).
+  Should also cover an SSD on eSATA, though that's untested.
 - Slows down or removes the DSM scheduled jobs that wake the disks (disk health, BTRFS maintenance,
   cert renewal, telemetry, update checks), driven by a config file you control.
 - Mounts the system partition, and optionally your volumes, `noatime` so reads stop causing writes.
