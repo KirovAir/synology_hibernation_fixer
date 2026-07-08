@@ -61,7 +61,7 @@ next to it, and applies everything straight away. To update later, `git pull` in
 ```bash
 sudo python3 hiber_fixer.py --run         # apply everything now (what the boot task runs)
 sudo python3 hiber_fixer.py --status      # what's on, what's patched, config summary
-sudo python3 hiber_fixer.py --configure   # choose what happens to each scheduled job
+sudo python3 hiber_fixer.py --configure   # toggle the fixes and choose what each scheduled job does
 sudo python3 hiber_fixer.py --diagnose    # patch details, handy after a DSM update
 sudo python3 hiber_fixer.py --uninstall   # remove the boot task and undo the config changes
 ```
@@ -87,8 +87,10 @@ sleep, then run `--run`.
 
 The `synocrond_tasks` block lists DSM's scheduled jobs with an action for each: `unchanged`,
 `hourly`, `daily`, `weekly`, `monthly`, or `delete`. It ships with sensible defaults, and jobs from
-future DSM or package updates get added as `unchanged` so you can review them. Run `--configure` to
-walk through them instead of editing JSON by hand.
+future DSM or package updates get added as `unchanged` so you can review them.
+
+Rather than editing this file by hand, `--configure` walks you through everything interactively:
+first each fix (on/off), then each scheduled job. After changing anything, run `--run` to apply it.
 
 ## If it stops working after a DSM update
 

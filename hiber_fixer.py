@@ -156,6 +156,15 @@ DEFAULT_FIXES = {
     "ssd_slot_in_memory_patch": False,
 }
 
+# One-line descriptions for --configure. Order here is the order shown.
+FIX_DESCRIPTIONS = {
+    "nvme_in_memory_patch": "Stop NVMe activity from keeping the HDDs awake (x86 only)",
+    "ssd_slot_in_memory_patch": "Stop an SSD in a SATA/eSATA bay from keeping the HDDs awake (x86 only)",
+    "remount_root_noatime": "Mount / with noatime so reads don't cause writes",
+    "set_volumes_noatime": "Set your data volumes to noatime too (applies on next reboot)",
+    "disable_hibernation_debug": "Turn off DSM's hibernation debug logger",
+}
+
 
 def describe_task(name: str) -> str:
     entry = TASK_DEFAULTS.get(name)
@@ -1646,24 +1655,42 @@ def cmd_diagnose() -> int:
 
 
 def cmd_configure(config_path: str) -> int:
-    """Interactive editor for the synocrond task actions."""
+    """Interactive editor for the fixes (on/off) and the synocrond task actions."""
     cfg = load_config(config_path) if os.path.exists(config_path) else default_config()
+    fixes = cfg["fixes"]
     discovered = discover_tasks()
     actions = cfg["synocrond_tasks"]
-
-    names = sorted(set(discovered) | set(actions))
-    print("Choose an action per task. Enter = keep current default.")
-    print("Options: (u)nchanged (h)ourly (d)aily (w)eekly (m)onthly (x)delete\n")
     letter = {"u": "unchanged", "h": "hourly", "d": "daily", "w": "weekly", "m": "monthly", "x": "delete"}
     try:
+        print("== Fixes ==   (y = on, n = off, Enter = keep current)\n")
+        for key in FIX_DESCRIPTIONS:
+            cur = bool(fixes.get(key, DEFAULT_FIXES.get(key, False)))
+            print("%s   [currently %s]" % (key, "on" if cur else "off"))
+            print("     %s" % FIX_DESCRIPTIONS[key])
+            while True:
+                ch = input("     enable? [y/n, Enter=keep]: ").strip().lower()
+                if not ch:
+                    break
+                if ch[0] == "y":
+                    fixes[key] = True
+                    break
+                if ch[0] == "n":
+                    fixes[key] = False
+                    break
+                print("     please answer y or n")
+            print()
+
+        names = sorted(set(discovered) | set(actions))
+        print("== Scheduled jobs ==   (Enter = keep current)")
+        print("Options: (u)nchanged (h)ourly (d)aily (w)eekly (m)onthly (x)delete\n")
         for i, name in enumerate(names, 1):
             cur_period = discovered.get(name, "(not present)")
             descr = describe_task(name)
-            default = actions.get(name, "unchanged")
+            action = actions.get(name, "unchanged")
             print("[%d/%d] %s" % (i, len(names), name))
             if descr:
                 print("     %s" % descr)
-            print("     current interval: %s   default action: %s" % (cur_period, default))
+            print("     current interval: %s   action: %s" % (cur_period, action))
             while True:
                 ch = input("     action [u/h/d/w/m/x]: ").strip().lower()
                 if not ch:
@@ -1677,7 +1704,6 @@ def cmd_configure(config_path: str) -> int:
         print("\nCancelled; nothing saved.")
         return 1
 
-    cfg["synocrond_tasks"] = actions
     save_config(config_path, cfg)
     print("Saved %s" % config_path)
     return 0
