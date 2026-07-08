@@ -1,114 +1,142 @@
-# Synology DSM HDD hibernation fixer
+# Synology HDD hibernation fixer
 
-Makes the hard drives of an x86 Synology NAS actually spin down (hibernate) by removing the
-things that keep waking them up. It is especially useful when you run Docker containers on an
-NVMe volume — by default DSM won't let HDDs hibernate while there is any NVMe activity.
+This script fixes the handful of things that stop a Synology NAS from hibernating its hard drives.
 
-This is a cleaned-up rewrite of [AlexFromChaos/synology_hibernation_fixer](https://github.com/AlexFromChaos/synology_hibernation_fixer)
-(upstream, unmaintained since 2023). The fixes are based on the writeups
+It's especially useful if you run Docker on an NVMe drive or an SSD. By default DSM has a flaw where
+that activity keeps the hard drives spinning, even when nothing is actually touching them.
+
+It's a cleaned-up fork of [AlexFromChaos's original](https://github.com/AlexFromChaos/synology_hibernation_fixer),
+which worked out why this happens and how to patch it (he wrote it up
 [here](https://www.reddit.com/r/synology/comments/10cpbqd/making_disk_hibernation_work_on_synology_dsm_7/)
-and [here](https://www.reddit.com/r/synology/comments/129lzjg/fixing_hdd_hibernation_when_you_have_docker_on/).
+and [here](https://www.reddit.com/r/synology/comments/129lzjg/fixing_hdd_hibernation_when_you_have_docker_on/)).
+This version installs itself as a boot task that reapplies the fixes on each boot, and adds one for
+an SSD sitting in a SATA drive bay.
 
-Supported: **x86_64 NAS models on DSM 7.0 – 7.3** (verified against DSM 7.3.2).
+Developed and tested on a DS920+ (DSM 7.3.2). It targets x86_64 models on DSM 7.0 through 7.3, and
+runs on ARM too, just without the process patches (see the table).
 
-## What it fixes
+## What it does
 
-Applied every time `--run` executes:
+Each run applies these fixes:
 
-1. **NVMe hibernation patch** — patches the *running* `scemd` and `synostgd-disk` processes in
-   memory so ongoing NVMe I/O no longer blocks HDD hibernation. Only process memory is changed,
-   never the on-disk binary, so this re-applies on each boot.
-2. **synocrond task tuning** — slows down or deletes the many built-in background jobs (disk
-   health, BTRFS maintenance, cert renewal, data collection, …) that wake disks. What to do with
-   each job is declared in a plain JSON config file — no more baking choices into the source.
-3. **noatime** — remounts `/` `noatime`, and (opt-in) sets data volumes to `noatime`.
-4. **synocached** — lowers the redis/synocached idle timeout from 3600 s to 900 s.
-5. **hibernation debug logger** — turns off DSM's HDD-hibernation wakeup logger, which writes
-   `hibernationFull.log` to the system partition (mirrored onto the HDDs) and keeps them awake.
+- Stops NVMe activity from keeping the HDDs awake.
+- Stops an SSD used as a data volume in a drive bay from keeping the HDDs awake (off by default).
+- Slows down or removes the DSM scheduled jobs that wake the disks (disk health, BTRFS maintenance,
+  cert renewal, telemetry, update checks), driven by a config file you control.
+- Mounts the system partition, and optionally your volumes, `noatime` so reads stop causing writes.
+- Turns off DSM's hibernation debug logger, which writes to the system partition and keeps the
+  disks up on its own.
 
-## How it persists (what changed vs. the original)
+The first two only ever change memory in the running processes, never the files on disk, so a
+reboot clears them and the boot task puts them back.
 
-The original embedded the *entire script* as an `xz`+`base64` blob inside the Task Scheduler
-task. **This version does not.** Instead:
+## Which fixes run where
 
-- `--install` copies the script to a data volume (default `/volume1/hiber_fixer/`) and writes a
-  config file next to it (`hiber_fixer.config.json`).
-- It creates a boot-up Task Scheduler task that simply runs
-  `python3 /volume1/hiber_fixer/hiber_fixer.py --run`.
+| Fix | x86_64 | ARM |
+|---|:---:|:---:|
+| Stop NVMe activity from keeping the HDDs awake | Yes | No |
+| Stop an SSD in a drive bay from keeping the HDDs awake | Yes | No |
+| Everything else (scheduled jobs, noatime, debug logger) | Yes | Yes |
 
-Both the task (kept in DSM's database) and the script (on a user volume) survive DSM upgrades.
+The No's are the two in-memory patches. They are x86_64 machine code, so ARM skips them with a note
+in the log and runs everything else. Most ARM models have no NVMe slot anyway, so an SSD in a SATA
+bay is really the only thing an ARM user would miss.
 
-> **Note:** DSM updates sometimes *disable* root-privileged boot tasks. If your disks stop
-> hibernating after an update, run `--status`; if the task shows `DISABLED`, re-enable it in
-> **Control Panel → Task Scheduler**, or just re-run `--install`.
+## Install
 
-## Usage
-
-SSH into your NAS and switch to root (`sudo -i`), then:
+Put the script somewhere that survives a reboot. A git clone on a data volume works well, say
+`/volume1/homes/you/dev/synology_hibernation_fixer`. SSH in, go to that folder, and run it as root:
 
 ```bash
-# install (copies to /volume1/hiber_fixer, creates the boot task, applies fixes now)
-python3 hiber_fixer.py --install
-# or choose a different install location:
-python3 hiber_fixer.py --install --install-dir /volume2/hiber_fixer
-
-python3 hiber_fixer.py --run         # apply everything now (what the boot task runs)
-python3 hiber_fixer.py --status      # show current state (task, patch, noatime, config)
-python3 hiber_fixer.py --configure   # interactively edit which jobs to slow down / delete
-python3 hiber_fixer.py --diagnose    # dump patch-site info (use if a DSM update breaks the patch)
-python3 hiber_fixer.py --restore     # undo the synocrond/synocached/volume changes (from /var/synobackup)
-python3 hiber_fixer.py --uninstall   # remove the boot task
+sudo python3 hiber_fixer.py --install
 ```
 
-After `--install` you can delete the copy you ran it from; the active copy lives in the install
-directory. Logs go to `/var/log/hibernation_fixer.log`; backups of any modified config file go to
-`/var/synobackup`.
+That points a boot task at the script where it sits (nothing gets copied), writes a config file
+next to it, and applies everything straight away. To update later, `git pull` in that folder and run
+`sudo python3 hiber_fixer.py --run`.
 
-## The config file
+## Commands
 
-`hiber_fixer.config.json` (created next to the script on install):
+```bash
+sudo python3 hiber_fixer.py --run         # apply everything now (what the boot task runs)
+sudo python3 hiber_fixer.py --status      # what's on, what's patched, config summary
+sudo python3 hiber_fixer.py --configure   # choose what happens to each scheduled job
+sudo python3 hiber_fixer.py --diagnose    # patch details, handy after a DSM update
+sudo python3 hiber_fixer.py --uninstall   # remove the boot task and undo the config changes
+```
+
+## Settings
+
+`hiber_fixer.config.json` sits next to the script. The `fixes` block turns each fix on or off:
 
 ```json
 {
     "fixes": {
         "nvme_in_memory_patch": true,
+        "ssd_slot_in_memory_patch": false,
         "remount_root_noatime": true,
-        "synocached_timeout_900": true,
         "set_volumes_noatime": true,
         "disable_hibernation_debug": true
-    },
-    "synocrond_tasks": {
-        "builtin-synodatacollect-udc": "delete",
-        "builtin-libhwcontrol-disk_weekly_routine": "weekly",
-        "...": "..."
     }
 }
 ```
 
-Each task action is one of `unchanged | hourly | daily | weekly | monthly | delete`. Sensible
-defaults are filled in; edit and re-run `--run`. New tasks introduced by future DSM/package
-updates are added automatically (as `unchanged`) so you can review them. `set_volumes_noatime`
-(default `true`) also sets your data volumes to `noatime`, which takes effect on the next reboot;
-set it to `false` to leave volume mount options untouched.
+Set `ssd_slot_in_memory_patch` to `true` if you run an SSD in a SATA bay next to HDDs you want to
+sleep, then run `--run`.
 
-## How the NVMe patch works (for the curious)
+The `synocrond_tasks` block lists DSM's scheduled jobs with an action for each: `unchanged`,
+`hourly`, `daily`, `weekly`, `monthly`, or `delete`. It ships with sensible defaults, and jobs from
+future DSM or package updates get added as `unchanged` so you can review them. Run `--configure` to
+walk through them instead of editing JSON by hand.
 
-Decompilation (Ghidra) shows both binaries call `SYNODiskPortEnum(portType, &list)` to build a
-list of disk ports, then decide hibernation from it:
+## If it stops working after a DSM update
 
-- `scemd` (`polling_hibernation_timer.c`) enumerates port types **1, 2** (internal SATA) and
-  **7** (NVMe), then `DiskListIdleEnough(list)` decides whether the HDDs may sleep.
-- `synostgd-disk` (`disk_monitor.c`) loops enumerating port types **1, 3, 7, 11** and watches
-  each disk for activity.
+DSM updates sometimes disable root-level boot tasks, and now and then they rebuild the files this
+patches. Start with `--status`. A disabled boot task can be re-enabled in Control Panel > Task
+Scheduler, or just rerun `--install`. If `--status` shows a patch as not matching, `--diagnose`
+dumps what it found so the byte patterns can be regenerated.
 
-**Port type 7 is NVMe**, so including it lets NVMe I/O keep the HDDs awake. The patch removes NVMe
-from those lists — in `scemd` by changing the argument (`7` → `0x0B`), in `synostoraged` by
-inserting a 2-byte `jmp` that skips the type-7 enumeration. The byte patterns are identical across
-DSM 7.2 and 7.3.2; if a future DSM recompiles these binaries and the patterns stop matching,
-`--run` logs a loud error and `--diagnose` dumps the candidate sites so new patterns can be
-generated (re-decompile with Ghidra to confirm the `SYNODiskPortEnum(7,…)` site).
+## How it works
 
-## Uninstalling
+DSM lets the HDDs sleep once every internal disk has been idle for a while. NVMe drives and
+SSDs-in-bays land in that check even though they never sleep themselves, so their normal activity
+keeps the hard drives up. The fixes leave them out of the check.
 
-Delete the **"HDD Hibernation Fixer task"** in **Task Scheduler**, or run
-`python3 hiber_fixer.py --uninstall`. Reboot to fully revert the in-memory patch.
+The NVMe fix is a tiny edit to the running process. The SSD case takes more work, because DSM can't
+tell an SSD in a SATA bay apart from a hard drive by slot, so the patch adds its own check that
+skips SSDs. Both are written so that anything unexpected falls through to DSM's normal behaviour,
+which means the worst case is a fix that does nothing.
+
+For the full write-up (the disassembly, the exact bytes, the safety argument, and how to redo it
+after a DSM update) see [docs/hibernation-internals.md](docs/hibernation-internals.md). The research
+scripts and Ghidra setup live in [research/](research/).
+
+## Roadmap
+
+- The SSD-in-a-bay fix could handle other cases DSM gets wrong (mixed pools, cache SSDs, expansion
+  units) the same way, all without editing a file on disk.
+- A real Synology package (`.spk`) with a small UI: see which fixes are live, change settings
+  without SSH, watch hibernation stats. The CLI already exposes everything a UI would need.
+
+## Uninstall
+
+```bash
+sudo python3 hiber_fixer.py --uninstall
+sudo reboot
+```
+
+`--uninstall` removes the boot task and reverts the DSM settings it changed (volume noatime, the
+scheduled-job changes, the debug logger). The reboot clears the in-memory patches, which only ever
+live in RAM, and brings back the original mount settings. Delete the folder afterwards if you are
+done with it.
+
+## Credits and thanks
+
+Huge thanks to **[AlexFromChaos](https://github.com/AlexFromChaos)**. His original
+[synology_hibernation_fixer](https://github.com/AlexFromChaos/synology_hibernation_fixer) did the
+hard part: figuring out that `scemd` and `synostgd-disk` are what keep the HDDs awake, that NVMe
+gets pulled into the hibernation group through `SYNODiskPortEnum`, and how to patch the running
+processes to fix it. None of this exists without that work. His repo has been quiet since 2023, so
+this is a cleaned-up rewrite that carries it forward and adds a few things (the SSD-in-a-bay fix,
+run-in-place install, a real config, and a full write-up of the internals). The two posts linked up
+top are his, and both are worth reading.

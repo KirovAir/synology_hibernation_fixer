@@ -159,9 +159,14 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
-# Local research: DSM binaries (Synology proprietary — do not redistribute) and
-# config captures containing personal data. Kept locally, never committed.
-research/
+# Local research: the analysis SCRIPTS/docs under research/ ARE tracked (see research/README.md).
+# Only the proprietary DSM binaries (do NOT redistribute), logs and caches are ignored.
+research/**/bins/*
+!research/**/bins/SHA256SUMS.txt
+!research/**/bins/README.md
+research/**/*.log
+research/**/__pycache__/
+research/**/*.pyc
 
 # Runtime config written next to the installed script (per-machine state, not source).
 hiber_fixer.config.json

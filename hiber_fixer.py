@@ -7,17 +7,22 @@ Makes the hard drives spin down (hibernate) by removing what keeps waking them.
 `--run` applies these fixes: (1) an in-memory patch of the running scemd / synostgd-disk
 processes so ongoing NVMe I/O no longer blocks HDD hibernation (reapplied each boot;
 the on-disk binary is never touched), (2) synocrond task tuning driven by an external
-JSON config, (3) noatime for / and data volumes, (4) synocached idle timeout 3600 -> 900s,
-(5) turning off DSM's HDD-hibernation debug logger (it writes to the HDD system partition
-and keeps the disks awake).
+JSON config, (3) noatime for / and data volumes, (4) turning off DSM's HDD-hibernation debug
+logger (it writes to the HDD system partition and keeps the disks awake), (5) OPTIONAL (off by
+default): an in-memory code-cave patch of
+libsynoscemd's DiskListIdleEnough() so that an SSD living in a SATA/HDD bay no longer blocks
+the HDD hibernation group. Enable it with fixes.ssd_slot_in_memory_patch=true if you run an
+SSD in an internal drive bay alongside HDDs you want to sleep.
 
-`--install` copies this script to a data volume (default /volume1/hiber_fixer), writes a
-config file beside it, and creates a boot-up Task Scheduler task that just runs this
-script -- no compressed copy embedded in the task. Both survive DSM upgrades.
+`--install` creates a boot-up Task Scheduler task that runs this script from wherever it
+currently lives (no copying, no embedded blob) and writes a config file next to it. Keep the
+script somewhere that survives a reboot. A git clone on a data volume is ideal. `--uninstall`
+removes the boot task and undoes the config changes; reboot afterwards to drop the in-memory
+patches (they only live in RAM) and apply the restored mount settings.
 
-    sudo python3 hiber_fixer.py --install [--install-dir DIR]
+    sudo python3 hiber_fixer.py --install
     sudo python3 hiber_fixer.py --run | --status | --diagnose | --configure
-    sudo python3 hiber_fixer.py --uninstall [--purge] | --restore
+    sudo python3 hiber_fixer.py --uninstall
 """
 
 from __future__ import annotations
@@ -44,7 +49,6 @@ from typing import Dict, List, Optional, Tuple
 # --------------------------------------------------------------------------- #
 
 TASK_NAME = "HDD Hibernation Fixer task"          # kept identical to the old script so --install replaces it
-DEFAULT_INSTALL_DIR = "/volume1/hiber_fixer"
 CONFIG_BASENAME = "hiber_fixer.config.json"
 CONFIG_COMMENT = "Actions: unchanged|hourly|daily|weekly|monthly|delete. Edit, then re-run --run."
 LOG_PATH = "/var/log/hibernation_fixer.log"
@@ -55,11 +59,11 @@ PYTHON = "/usr/bin/python3"
 
 SCEMD_PATH = "/usr/syno/bin/scemd"
 SYNOSTORAGED_PATH = "/usr/syno/sbin/synostoraged"
+LIBSYNOSCEMD_PATH = "/usr/lib/libsynoscemd.so.1"   # loaded inside the scemd process
 SYNOCROND_CONFIG_PATH = "/usr/syno/etc/synocrond.config"
 SPACE_TABLE_PATH = "/var/lib/space/space_table"
 VOLUME_CONF_PATH = "/usr/syno/etc/volume.conf"
 SYNOINFO_CONF_PATH = "/etc/synoinfo.conf"
-SYNOCACHED_DIR = "/usr/syno/etc/synocached"
 VERSION_PATH = "/etc.defaults/VERSION"
 SYNO_HIBERNATION_LOG_LEVEL = "/proc/sys/kernel/syno_hibernation_log_level"
 HIBERNATION_DEBUG_SERVICE = "hibernationdebug.service"
@@ -145,9 +149,11 @@ DEFAULT_TASK_ACTIONS: Dict[str, str] = {name: action for name, (action, _desc) i
 DEFAULT_FIXES = {
     "nvme_in_memory_patch": True,
     "remount_root_noatime": True,
-    "synocached_timeout_900": True,
     "set_volumes_noatime": True,        # also set data volumes noatime (applies on next reboot)
     "disable_hibernation_debug": True,  # stop DSM's wakeup logger writing to the HDD system partition
+    # Off by default: only needed if you run an SSD in an internal SATA/HDD bay next to HDDs
+    # you want to hibernate. Adds an in-memory code-cave patch to libsynoscemd (see below).
+    "ssd_slot_in_memory_patch": False,
 }
 
 
@@ -170,7 +176,7 @@ def run_cmd(args: List[str]) -> subprocess.CompletedProcess:
 
 
 def _load_manifest() -> dict:
-    """Manifest recording what the tool changed, so --restore can undo it."""
+    """Manifest recording what the tool changed, so --uninstall can undo it."""
     try:
         with open(BACKUP_MANIFEST) as f:
             m = json.load(f)
@@ -193,7 +199,7 @@ def _save_manifest(m: dict) -> None:
 
 def backup_file(path: str) -> None:
     """Back up a file into BACKUP_DIR before we modify it (best effort) and record it in
-    the manifest for --restore. Namespaced by full path; the first (pristine) copy is
+    the manifest for --uninstall. Namespaced by full path; the first (pristine) copy is
     kept across re-runs."""
     try:
         os.makedirs(BACKUP_DIR, exist_ok=True)
@@ -241,10 +247,10 @@ def syno_set_key_value(conf_file: str, key: str, value: str) -> bool:
 #                   ("cap", k)       -> reinsert the k-th captured group (1-based)
 #
 # Confirmed by Ghidra decompilation of the DSM 7.3.2 binaries:
-#   * scemd / polling_hibernation_timer.c -- the HDD-hibernation polling timer builds
+#   * scemd / polling_hibernation_timer.c: the HDD-hibernation polling timer builds
 #     a disk list via SYNODiskPortEnum(portType, &list) for port types 1 and 2 (internal
 #     SATA) plus 7 (NVMe), then DiskListIdleEnough(list) decides whether the HDDs may sleep.
-#   * synostgd-disk / disk_monitor.c -- a forked monitor loop enumerates port types
+#   * synostgd-disk / disk_monitor.c: a forked monitor loop enumerates port types
 #     1, 3, 7 (NVMe) and 11 and watches each disk for activity.
 # Port type 7 == NVMe, so including it lets NVMe I/O keep the HDDs awake. The fix removes
 # NVMe from these lists:
@@ -348,6 +354,310 @@ SYNOSTORAGED_TARGET = PatchTarget("synostgd-disk", SYNOSTORAGED_PATH, [
 ])
 
 PATCH_TARGETS = [SCEMD_TARGET, SYNOSTORAGED_TARGET]
+
+
+# --------------------------------------------------------------------------- #
+# 1b) In-memory code-cave patch: skip an SSD-in-a-HDD-bay in the hibernation gate
+# --------------------------------------------------------------------------- #
+#
+# THE PROBLEM
+#   On an x86 DSM box the internal drive bays form ONE hibernation group: scemd only spins
+#   the HDDs down once *every* internal disk has been idle past the standby timer. That
+#   decision comes from a single function, DiskListIdleEnough(list, threshold), exported by
+#   libsynoscemd.so.1 (scemd's private helper library). Ghidra-decompiled, it is:
+#
+#       for each disk in list:                       # list = all internal SATA + NVMe
+#           idle = read("/sys/block/<dev>/device/syno_idle_time")
+#           if (idle < threshold): return 0          # ANY disk active-recently => "not idle"
+#       return 1
+#
+#   An SSD sitting in a SATA bay (used as a data volume) enumerates as the *same port type*
+#   as the HDDs, so it ends up in `list`. syno_idle_time is per-disk (verified on hardware
+#   that SSD-only I/O never resets the HDD counters), so the SSD does not physically wake the
+#   HDDs. But its low idle time makes DiskListIdleEnough() return 0, so scemd never re-issues
+#   standby and the HDDs keep spinning. The NVMe fix above cannot help: it drops a whole port
+#   type, and the SSD shares the SATA port type with the HDDs we want to keep gating on.
+#
+# THE FIX
+#   Make DiskListIdleEnough() skip SSDs, exactly the way the sibling IsInternalDiskSelfTesting()
+#   in the same library already does:
+#       if (SYNODiskIsSSD("/dev/<dev>") == 1) continue;   # treat the SSD as always-idle
+#   SYNODiskIsSSD() (also already imported by libsynoscemd) simply reads
+#   /sys/block/<dev>/queue/rotational and returns 1 when the first byte is '0' (SSD).
+#
+#   There is no room to add a call inline, so we redirect one instruction into a code cave
+#   (the zero-filled tail of the library's own executable segment) and run the check there:
+#
+#     hook: the 5-byte `mov r13,[rsp+0x18]` right after the `access("/sys/block/<dev>")==0`
+#           test is replaced by a 5-byte `jmp CAVE`.
+#     CAVE (52 bytes):
+#           mov  r13,[rsp+0x18]         ; re-do the displaced instruction (r13 = scratch buffer)
+#           mov  rdi,r13
+#           mov  esi,0x1000
+#           lea  rdx,[rip+"/dev/%s"]
+#           mov  rcx,r12               ; r12 = bare disk name, e.g. "sata1"
+#           xor  eax,eax
+#           call snprintf              ; build "/dev/sata1" into the scratch buffer
+#           mov  rdi,r13
+#           call SYNODiskIsSSD         ; reads /sys/block/sata1/queue/rotational
+#           cmp  eax,1
+#           je   <skip>                ; SSD -> jump to the "disk done, don't block" path
+#           jmp  <cont>                ; else -> continue the normal syno_idle_time check
+#
+# WHY IT'S SAFE (never crashes, never spins down a busy HDD)
+#   * Fail-safe by construction: only SYNODiskIsSSD()==1 skips a disk. A HDD returns 0 and an
+#     error returns something != 1, so `je` is not taken and we fall through to the ORIGINAL
+#     behavior, so the worst case is exactly "no patch".
+#   * Register/ABI clean: the only registers we clobber (rax/rcx/rdx/rsi/rdi/r8-r11) are dead
+#     at the hook; r12/r13/rbp/rbx/r14/r15 are callee-saved and preserved across both calls;
+#     rsp is untouched, so call alignment is preserved. The scratch buffer reuses the
+#     function's own 4 KiB stack buffer.
+#   * Crash-safe apply order: the cave is written and verified FIRST, then the 5-byte jump is
+#     written last, so a failed/partial write never leaves a live jump into empty space.
+#   * Every write is read back; a no-match aborts loudly instead of patching blindly.
+#
+# Everything below is computed from the actual library at apply time (hook/skip located by
+# byte pattern; the cave address, the snprintf / SYNODiskIsSSD PLT stubs and the "/dev/%s"
+# string resolved straight from the ELF), so it adapts to a rebuilt library instead of
+# hard-coding offsets, and it refuses to touch anything it cannot resolve.
+
+# The two anchors we locate by byte pattern. Wildcards ("any", n) cover the rip-relative
+# displacements of the `jne`/`lea` instructions, which differ between builds.
+SSD_CAVE_HOOK_PATTERN = [                       # ...==0 test; the mov is the hook site
+    b"\x85\xC0\x0F\x85", ("any", 4),            # test eax,eax ; jne <access failed>
+    b"\x4C\x8B\x6C\x24\x18\xBA\x02\x00\x00\x00\x49\x89\xE9\x4C\x8D\x05", ("any", 4),
+    b"\xB9\x00\x10\x00\x00\xBE\x00\x10\x00\x00\x4C\x89\xEF",
+]                                               # hook = mov r13,[rsp+0x18] at match.start()+8
+SSD_CAVE_SKIP_PATTERN = [                        # the "this disk is idle enough / done" path
+    b"\x39\x44\x24\x14\x0F\x8F", ("any", 4),     # cmp [rsp+0x14],eax ; jg <not idle>
+    b"\x45\x31\xED\x83\xC3\x01\x41\x39\x5E\x04",  # xor r13d,r13d ; add ebx,1 ; cmp [r14+4],ebx
+]                                                # skip = xor r13d,r13d at match.start()+10
+SSD_CAVE_HOOK_INSN = b"\x4C\x8B\x6C\x24\x18"     # mov r13,[rsp+0x18]  (the 5 bytes we replace)
+SSD_CAVE_SKIP_INSN = b"\x45\x31\xED"             # xor r13d,r13d
+DEV_FMT_STRING = "/dev/%s"
+
+
+# ---- minimal ELF reader (program headers, dynamic table, PLT, rodata) ----- #
+# Self-contained (stdlib struct only) so it works on the NAS with no extra modules.
+
+def _elf_phdrs(data: bytes):
+    """Return [(p_type, p_flags, p_offset, p_vaddr, p_filesz, p_memsz), ...]."""
+    if data[:4] != b"\x7fELF" or data[4] != 2:
+        raise ValueError("not an ELF64 file")
+    e_phoff = struct.unpack_from("<Q", data, 32)[0]
+    e_phentsize = struct.unpack_from("<H", data, 54)[0]
+    e_phnum = struct.unpack_from("<H", data, 56)[0]
+    phdrs = []
+    for i in range(e_phnum):
+        o = e_phoff + i * e_phentsize
+        p_type, p_flags = struct.unpack_from("<II", data, o)
+        p_offset, p_vaddr = struct.unpack_from("<QQ", data, o + 8)
+        p_filesz, p_memsz = struct.unpack_from("<QQ", data, o + 32)
+        phdrs.append((p_type, p_flags, p_offset, p_vaddr, p_filesz, p_memsz))
+    return phdrs
+
+
+def _elf_va_to_foff(phdrs, va: int) -> Optional[int]:
+    for t, _fl, off, vaddr, filesz, _memsz in phdrs:
+        if t == 1 and vaddr <= va < vaddr + filesz:      # PT_LOAD
+            return off + (va - vaddr)
+    return None
+
+
+def _elf_foff_to_va(phdrs, foff: int) -> Optional[int]:
+    for t, _fl, off, vaddr, filesz, _memsz in phdrs:
+        if t == 1 and off <= foff < off + filesz:
+            return vaddr + (foff - off)
+    return None
+
+
+def _elf_exec_seg(phdrs):
+    """(offset, vaddr, filesz, memsz) of the executable PT_LOAD, or None."""
+    for t, fl, off, vaddr, filesz, memsz in phdrs:
+        if t == 1 and (fl & 1):                          # PT_LOAD + PF_X
+            return off, vaddr, filesz, memsz
+    return None
+
+
+def _elf_dyn_tags(phdrs, data) -> Dict[int, int]:
+    """First value seen for each DT_* tag in PT_DYNAMIC."""
+    tags: Dict[int, int] = {}
+    for t, _fl, off, _va, _fsz, _msz in phdrs:
+        if t == 2:                                       # PT_DYNAMIC
+            p = off
+            while True:
+                tag, val = struct.unpack_from("<qQ", data, p)
+                p += 16
+                if tag == 0:                             # DT_NULL
+                    break
+                tags.setdefault(tag, val)
+            break
+    return tags
+
+
+def _elf_plt_stub(phdrs, data, symname: str) -> Optional[int]:
+    """Virtual address of the .plt(.sec) stub the code calls for an imported symbol.
+
+    Resolve the symbol's GOT slot from .rela.plt (DT_JMPREL/DT_PLTRELSZ), then find the
+    `jmp [rip+disp]` in the executable segment that points at that slot; the stub start is
+    that instruction aligned down to 16. For CET binaries there are two stubs per symbol
+    (.plt lazy + .plt.sec); the one the compiler *calls* begins with endbr64, so prefer it.
+    """
+    DT_PLTRELSZ, DT_STRTAB, DT_SYMTAB, DT_SYMENT, DT_JMPREL = 2, 5, 6, 11, 23
+    tg = _elf_dyn_tags(phdrs, data)
+    symtab, strtab = tg.get(DT_SYMTAB), tg.get(DT_STRTAB)
+    syment, jmprel, pltsz = tg.get(DT_SYMENT, 24), tg.get(DT_JMPREL), tg.get(DT_PLTRELSZ)
+    if not all((symtab, strtab, jmprel, pltsz)):
+        return None
+
+    def sym_name(idx: int) -> str:
+        st_name = struct.unpack_from("<I", data, _elf_va_to_foff(phdrs, symtab) + idx * syment)[0]
+        base = _elf_va_to_foff(phdrs, strtab) + st_name
+        return data[base:data.index(b"\x00", base)].decode("latin1")
+
+    got_slot = None
+    jf = _elf_va_to_foff(phdrs, jmprel)
+    for off in range(jf, jf + pltsz, 24):                # Elf64_Rela: r_offset, r_info, r_addend
+        r_off, r_info = struct.unpack_from("<QQ", data, off)
+        if sym_name(r_info >> 32) == symname:
+            got_slot = r_off
+            break
+    if got_slot is None:
+        return None
+
+    eo, eva, efsz, _emsz = _elf_exec_seg(phdrs)
+    code = data[eo:eo + efsz]
+    candidates = []
+    i = 0
+    while True:
+        j = code.find(b"\xFF\x25", i)                    # jmp [rip+disp32]
+        if j < 0:
+            break
+        disp = struct.unpack_from("<i", code, j + 2)[0]
+        if eva + j + 6 + disp == got_slot:
+            candidates.append((eva + j) // 16 * 16)
+        if j >= 1 and code[j - 1] == 0xF2:               # bnd jmp [rip+disp32]
+            if eva + (j - 1) + 7 + disp == got_slot:
+                candidates.append((eva + j - 1) // 16 * 16)
+        i = j + 2
+    for c in candidates:                                 # prefer the endbr64 (.plt.sec) stub
+        fo = _elf_va_to_foff(phdrs, c)
+        if fo is not None and data[fo:fo + 4] == b"\xF3\x0F\x1E\xFA":
+            return c
+    return candidates[0] if candidates else None
+
+
+def _elf_find_string(phdrs, data, text: str) -> Optional[int]:
+    """Virtual address of a NUL-terminated string in a non-executable PT_LOAD (rodata)."""
+    needle = text.encode() + b"\x00"
+    for t, fl, off, vaddr, filesz, _memsz in phdrs:
+        if t == 1 and not (fl & 1):
+            idx = data.find(needle, off, off + filesz)
+            if idx >= 0:
+                return vaddr + (idx - off)
+    return None
+
+
+@dataclass
+class SSDCavePlan:
+    hook_vaddr: int          # where the 5-byte jmp goes
+    hook_orig: bytes         # mov r13,[rsp+0x18]
+    hook_new: bytes          # jmp CAVE
+    cave_vaddr: int          # start of the cave in the exec-segment tail slack
+    cave_orig: bytes         # what should be there before patching (zeros)
+    cave_new: bytes          # the 52-byte cave body
+    # resolved addresses, kept for --diagnose visibility
+    skip_vaddr: int
+    cont_vaddr: int
+    devfmt_vaddr: int
+    snprintf_plt: int
+    isssd_plt: int
+
+
+def build_ssd_cave_patch(data: bytes) -> "SSDCavePlan | str":
+    """Compute the SSD-skip cave for this libsynoscemd image, or return an error string."""
+    phdrs = _elf_phdrs(data)
+
+    hooks = list(_compile_search(SSD_CAVE_HOOK_PATTERN).finditer(data))
+    skips = list(_compile_search(SSD_CAVE_SKIP_PATTERN).finditer(data))
+    if len(hooks) != 1:
+        return "DiskListIdleEnough hook pattern matched %d times (expected 1)" % len(hooks)
+    if len(skips) != 1:
+        return "idle-loop skip pattern matched %d times (expected 1)" % len(skips)
+
+    hook_foff = hooks[0].start() + 8
+    skip_foff = skips[0].start() + 10
+    if data[hook_foff:hook_foff + 5] != SSD_CAVE_HOOK_INSN:
+        return "hook instruction mismatch (got %s)" % data[hook_foff:hook_foff + 5].hex()
+    if data[skip_foff:skip_foff + 3] != SSD_CAVE_SKIP_INSN:
+        return "skip instruction mismatch (got %s)" % data[skip_foff:skip_foff + 3].hex()
+
+    hook_vaddr = _elf_foff_to_va(phdrs, hook_foff)
+    skip_vaddr = _elf_foff_to_va(phdrs, skip_foff)
+    if hook_vaddr is None or skip_vaddr is None:
+        return "hook/skip not inside a PT_LOAD segment"
+    cont_vaddr = hook_vaddr + 5                           # instruction right after the hook
+
+    exec_seg = _elf_exec_seg(phdrs)
+    if not exec_seg:
+        return "no executable PT_LOAD segment"
+    _eo, eva, efsz, emsz = exec_seg
+    cave_vaddr = (eva + efsz + 15) & ~15                  # 16-aligned start of the tail slack
+    page_end = (eva + emsz + 0xFFF) & ~0xFFF              # slack runs to the end of the last page
+
+    devfmt = _elf_find_string(phdrs, data, DEV_FMT_STRING)
+    snprintf_plt = _elf_plt_stub(phdrs, data, "snprintf")
+    isssd_plt = _elf_plt_stub(phdrs, data, "SYNODiskIsSSD")
+    if devfmt is None:
+        return "could not find the \"/dev/%s\" format string"
+    if snprintf_plt is None or isssd_plt is None:
+        return "could not resolve snprintf / SYNODiskIsSSD PLT stubs"
+
+    # Assemble the cave. op() appends the opcode bytes first, then (when a target is given)
+    # a rip-relative rel32 measured from the END of the instruction, so Python evaluation
+    # order can never silently shift a displacement.
+    code = bytearray()
+
+    def op(opcodes: bytes, target: Optional[int] = None) -> None:
+        code.extend(opcodes)
+        if target is not None:
+            code.extend(struct.pack("<i", target - (cave_vaddr + len(code) + 4)))
+
+    op(b"\x4C\x8B\x6C\x24\x18")           # mov r13,[rsp+0x18]   (displaced instruction)
+    op(b"\x4C\x89\xEF")                   # mov rdi,r13
+    op(b"\xBE\x00\x10\x00\x00")           # mov esi,0x1000
+    op(b"\x48\x8D\x15", devfmt)           # lea rdx,[rip+"/dev/%s"]
+    op(b"\x4C\x89\xE1")                   # mov rcx,r12          (bare disk name)
+    op(b"\x31\xC0")                       # xor eax,eax
+    op(b"\xE8", snprintf_plt)             # call snprintf
+    op(b"\x4C\x89\xEF")                   # mov rdi,r13
+    op(b"\xE8", isssd_plt)                # call SYNODiskIsSSD
+    op(b"\x83\xF8\x01")                   # cmp eax,1
+    op(b"\x0F\x84", skip_vaddr)           # je  <skip>          (SSD: don't block)
+    op(b"\xE9", cont_vaddr)               # jmp <cont>          (else: normal idle check)
+    cave_new = bytes(code)
+
+    if cave_vaddr + len(cave_new) > page_end:
+        return "cave (%d bytes) does not fit the executable tail slack" % len(cave_new)
+
+    hook_new = b"\xE9" + struct.pack("<i", cave_vaddr - (hook_vaddr + 5))
+    return SSDCavePlan(
+        hook_vaddr=hook_vaddr, hook_orig=SSD_CAVE_HOOK_INSN, hook_new=hook_new,
+        cave_vaddr=cave_vaddr, cave_orig=b"\x00" * len(cave_new), cave_new=cave_new,
+        skip_vaddr=skip_vaddr, cont_vaddr=cont_vaddr, devfmt_vaddr=devfmt,
+        snprintf_plt=snprintf_plt, isssd_plt=isssd_plt,
+    )
+
+
+@dataclass
+class CaveTarget:
+    """A process whose *loaded library* we patch with a computed code cave (not a pattern)."""
+    process_name: str        # process the library lives in (scemd)
+    binary_path: str         # the library on disk (== the mapped file)
+    name: str                # human label for status/diagnose
+
+
+SSD_CAVE_TARGET = CaveTarget("scemd", LIBSYNOSCEMD_PATH, "libsynoscemd SSD-slot skip")
 
 
 # ---- ELF file-offset -> virtual-address mapping -------------------------- #
@@ -530,9 +840,36 @@ class PatchOutcome:
     error: Optional[str] = None
 
 
-def resolve_sites(target: PatchTarget):
+def resolve_cave_sites(target: CaveTarget):
+    """Resolve the SSD-skip code cave for a CaveTarget, in the same (pid, name, sites, error)
+    shape as resolve_sites. sites are ordered cave-first so the crash-safe write order (cave
+    body before the 5-byte jump) falls out of the sequential write in write_mem()."""
+    pid = get_pid_by_name(target.process_name)
+    if not pid:
+        return None, None, None, "process '%s' not running" % target.process_name
+    module = os.path.basename(target.binary_path)
+    base = get_module_base(pid, module)
+    if base is None:
+        return pid, None, None, "could not find %s mapped in pid %d" % (module, pid)
+    try:
+        data = open(target.binary_path, "rb").read()
+    except OSError as e:
+        return pid, None, None, "cannot read %s: %s" % (target.binary_path, e)
+    plan = build_ssd_cave_patch(data)
+    if isinstance(plan, str):
+        return pid, None, None, plan
+    sites = [
+        (base + plan.cave_vaddr, plan.cave_orig, plan.cave_new),   # write + verify first
+        (base + plan.hook_vaddr, plan.hook_orig, plan.hook_new),   # flip the hop last
+    ]
+    return pid, target.name, sites, None
+
+
+def resolve_sites(target):
     """Return (pid, variant_name, sites, error) where sites = [(runtime_addr, orig, new)].
     Shared by apply_target (writes) and cmd_status (read-only report)."""
+    if isinstance(target, CaveTarget):
+        return resolve_cave_sites(target)
     pid = get_pid_by_name(target.process_name)
     if not pid:
         return None, None, None, "process '%s' not running" % target.process_name
@@ -594,7 +931,7 @@ def apply_target(ptrace: Ptrace, target: PatchTarget) -> PatchOutcome:
     return out
 
 
-def do_in_memory_fixes() -> bool:
+def do_in_memory_fixes(targets) -> bool:
     try:
         ptrace = Ptrace()
     except Exception as e:
@@ -603,7 +940,7 @@ def do_in_memory_fixes() -> bool:
 
     all_ok = True
     unmatched = []
-    for target in PATCH_TARGETS:
+    for target in targets:
         outcome = apply_target(ptrace, target)
         if outcome.error and not outcome.already_patched:
             all_ok = False
@@ -612,7 +949,7 @@ def do_in_memory_fixes() -> bool:
 
     if unmatched:
         # Loud so a future DSM that changes these binaries is visible, not a silent no-op.
-        log.error("!!! NVMe hibernation patch no longer matches %s -- run 'hiber_fixer.py --diagnose'",
+        log.error("!!! hibernation patch no longer matches %s -- run 'hiber_fixer.py --diagnose'",
                   ", ".join(unmatched))
     return all_ok
 
@@ -704,7 +1041,7 @@ def discover_tasks() -> Dict[str, str]:
 
 def _handle_dyn_task_deletion(name: str) -> None:
     """Extra work required to keep certain 'dynamic' tasks from coming back.
-    Original state is recorded in the manifest so --restore can undo it."""
+    Original state is recorded in the manifest so --uninstall can undo it."""
     if name == "builtin-dyn-autopkgupgrade-default":
         m = _load_manifest()
         dirty = False
@@ -818,7 +1155,7 @@ def apply_config_to_synocrond_config(actions: Dict[str, str]) -> bool:
 
 
 # --------------------------------------------------------------------------- #
-# 3) noatime + 4) synocached fixes
+# 3) noatime
 # --------------------------------------------------------------------------- #
 
 def root_is_noatime() -> bool:
@@ -840,28 +1177,10 @@ def remount_root_noatime() -> None:
         log.info("remounted / as noatime")
 
 
-def apply_synocached_fix() -> None:
-    for fname in ("synocached.conf", "synocached.default.conf"):
-        path = os.path.join(SYNOCACHED_DIR, fname)
-        if not os.path.exists(path):
-            continue
-        try:
-            with open(path) as f:
-                data = f.read()
-            new_data = data.replace("timeout 3600", "timeout 900")
-            if new_data != data:
-                backup_file(path)
-                with open(path, "w") as f:
-                    f.write(new_data)
-                log.info("lowered synocached idle timeout in %s", path)
-        except OSError as e:
-            log.error("cannot update %s: %s", path, e)
-
-
 def apply_hibernation_debug_off() -> None:
     """Turn off DSM's HDD-hibernation debug logger. It writes /var/log/hibernationFull.log to
     md0 (the system partition, which is RAID1-mirrored onto the HDDs), so it keeps the disks
-    awake on its own. The synoinfo flag is persistent (recorded in the manifest for --restore);
+    awake on its own. The synoinfo flag is persistent (recorded in the manifest for --uninstall);
     the kernel log level and the service reset on reboot, so we re-apply those on every run."""
     cur = syno_get_key_value(SYNOINFO_CONF_PATH, "enable_hibernation_debug")
     if cur == "yes":
@@ -1077,10 +1396,11 @@ def wait_for_system(timeout: int = BOOT_WAIT_TIMEOUT) -> bool:
                       lambda: log.warning("system did not finish booting within %ds; continuing anyway", timeout))
 
 
-def wait_for_daemons(timeout: int = BOOT_WAIT_TIMEOUT) -> bool:
-    """Wait until the in-memory patch targets (scemd, synostgd-disk) are running."""
+def wait_for_daemons(targets, timeout: int = BOOT_WAIT_TIMEOUT) -> bool:
+    """Wait until the in-memory patch targets' processes are running."""
+    procs = sorted({t.process_name for t in targets})
     def missing():
-        return [t.process_name for t in PATCH_TARGETS if not get_pid_by_name(t.process_name)]
+        return [p for p in procs if not get_pid_by_name(p)]
     return wait_until(lambda: not missing(), timeout,
                       lambda: log.error("patch target daemon(s) not running within %ds: %s", timeout, ", ".join(missing())))
 
@@ -1101,14 +1421,18 @@ def cmd_run(config_path: str, wait: bool = True) -> int:
     ok = True
     if fixes.get("remount_root_noatime", True):
         remount_root_noatime()
-    if fixes.get("nvme_in_memory_patch", True):
+    mem_targets = list(PATCH_TARGETS) if fixes.get("nvme_in_memory_patch", True) else []
+    if fixes.get("ssd_slot_in_memory_patch", False):
+        mem_targets.append(SSD_CAVE_TARGET)
+    if mem_targets and not is_x86():
+        log.warning("in-memory patches skipped: unsupported architecture %s (they are x86-64 only). "
+                    "The other fixes still apply.", platform.machine())
+    elif mem_targets:
         if wait:
-            wait_for_daemons()   # gate only the in-memory patch on the daemons being up
-        ok = do_in_memory_fixes() and ok
+            wait_for_daemons(mem_targets)   # gate only the in-memory patch on the daemons being up
+        ok = do_in_memory_fixes(mem_targets) and ok
     apply_config_to_task_files(actions)
     ok = apply_config_to_synocrond_config(actions) and ok
-    if fixes.get("synocached_timeout_900", True):
-        apply_synocached_fix()
     if fixes.get("disable_hibernation_debug", True):
         apply_hibernation_debug_off()
 
@@ -1124,19 +1448,14 @@ def cmd_run(config_path: str, wait: bool = True) -> int:
     return 0 if ok else 1
 
 
-def cmd_install(script_path: str, install_dir: str) -> int:
-    install_dir = os.path.abspath(install_dir)
-    os.makedirs(install_dir, exist_ok=True)
-    installed_script = os.path.join(install_dir, "hiber_fixer.py")
+def cmd_install(script_path: str) -> int:
+    """Register the boot task to run this script from wherever it currently lives.
+    Nothing is copied: keep the script somewhere that survives a reboot (a git clone on a
+    data volume is ideal). The config file is written next to the script."""
+    script_path = os.path.abspath(script_path)
+    script_dir = os.path.dirname(script_path)
+    config_path = config_path_for(script_path)
 
-    src = os.path.abspath(script_path)
-    if src != installed_script:
-        shutil.copy2(src, installed_script)
-        print("Installed script to %s" % installed_script)
-    else:
-        print("Running from install location %s" % installed_script)
-
-    config_path = os.path.join(install_dir, CONFIG_BASENAME)
     if not os.path.exists(config_path):
         save_config(config_path, default_config())
         print("Wrote default config to %s" % config_path)
@@ -1145,7 +1464,11 @@ def cmd_install(script_path: str, install_dir: str) -> int:
         save_config(config_path, load_config(config_path))   # merge in newly discovered tasks
         print("Kept existing config %s" % config_path)
 
-    operation = "%s %s --run" % (PYTHON, installed_script)
+    if not script_path.startswith("/volume"):
+        print("WARNING: %s is not on a data volume (/volumeN)." % script_path)
+        print("         The boot task runs the script by path, so keep it where it survives a reboot.")
+
+    operation = "%s %s --run" % (PYTHON, script_path)
     delete_boot_task()
     if not create_boot_task(operation):
         print("ERROR: failed to create the boot-up Task Scheduler task")
@@ -1154,32 +1477,35 @@ def cmd_install(script_path: str, install_dir: str) -> int:
 
     print("\nApplying fixes now...")
     rc = cmd_run(config_path, wait=False)
-    print("\nInstallation complete. The fixes will re-apply automatically on every boot.")
-    print("You can delete the copy you ran --install from; the active copy lives in %s." % install_dir)
+    print("\nInstallation complete. The fixes will re-apply on every boot, running this script")
+    print("in place from %s." % script_dir)
     return rc
 
 
-def cmd_uninstall(script_path: str, purge: bool) -> int:
+def cmd_uninstall() -> int:
+    """Full teardown: remove the boot task and undo the config changes. The in-memory patches
+    live only in RAM, so a reboot clears them (and applies the restored mount settings)."""
     if delete_boot_task():
         print('Removed the "%s" boot task.' % TASK_NAME)
     else:
-        print('Could not remove the "%s" boot task (maybe already gone).' % TASK_NAME)
-    print("The in-memory NVMe patch is not persistent; reboot to fully revert it.")
-    if purge:
-        install_dir = os.path.dirname(os.path.abspath(script_path))
-        print("--purge: leaving %s in place; delete it manually if you want." % install_dir)
-        print("Backups of modified config files are in %s (undo them with --restore)." % BACKUP_DIR)
+        print('Boot task "%s" not found (already removed?).' % TASK_NAME)
+
+    print("Undoing config changes...")
+    restore_config_changes()
+
+    print("\nUninstalled. Reboot to finish: that drops the in-memory patches (they only live in")
+    print("RAM) and applies the restored noatime/mount settings. You can delete this folder too.")
     return 0
 
 
-def cmd_restore() -> int:
-    """Restore every file the tool backed up (synocrond config/tasks, synocached, volume.conf)
-    to its pristine pre-change content, and undo the recorded synoinfo/service side effects."""
+def restore_config_changes() -> None:
+    """Restore every file the tool backed up (synocrond config/tasks, volume.conf) to its
+    pristine pre-change content, and undo the recorded synoinfo/service side effects."""
     m = _load_manifest()
     files = m.get("files", {})
     if not files and not m.get("synoinfo") and not m.get("services_masked"):
-        print("Nothing to restore: no changes recorded in %s." % BACKUP_MANIFEST)
-        return 0
+        print("No config changes to undo (nothing recorded in %s)." % BACKUP_MANIFEST)
+        return
 
     restored, failed = [], []
     for path, dest_name in files.items():
@@ -1210,9 +1536,7 @@ def cmd_restore() -> int:
             pass
     subprocess.call(["systemctl", "restart", "synocrond"])
 
-    print("Restored %d file(s) from %s:" % (len(restored), BACKUP_DIR))
-    for p in restored:
-        print("  %s" % p)
+    print("Restored %d config file(s) from %s." % (len(restored), BACKUP_DIR))
     if m.get("synoinfo"):
         print("Reverted synoinfo keys: %s" % ", ".join(sorted(m["synoinfo"])))
     if m.get("services_masked"):
@@ -1221,16 +1545,13 @@ def cmd_restore() -> int:
         print("Could NOT restore:")
         for x in failed:
             print("  %s" % x)
-    print("\nsynocrond restarted. Reboot to fully apply the restored volume.conf (atime) settings.")
-    print("This puts the config files back but leaves the boot task in place -- it would re-apply the")
-    print("fixes on the next boot. Run --uninstall (and reboot) as well for a permanent revert.")
-    return 0
 
 
-def _status_report_target(target: PatchTarget) -> None:
+def _status_report_target(target) -> None:
+    label = target.name if isinstance(target, CaveTarget) else target.process_name
     pid, variant, sites, error = resolve_sites(target)
     if sites is None:
-        print("  %s: %s" % (target.process_name, error))
+        print("  %s: %s" % (label, error))
         return
     states = []
     for addr, orig, new in sites:
@@ -1238,7 +1559,7 @@ def _status_report_target(target: PatchTarget) -> None:
         states.append("patched" if cur == new else "original" if cur == orig else "unknown")
     verdict = "PATCHED" if all(s == "patched" for s in states) else \
               "not patched" if all(s == "original" for s in states) else "partial/unknown"
-    print("  %s: %s (matched %s)" % (target.process_name, verdict, variant))
+    print("  %s: %s (matched %s)" % (label, verdict, variant))
 
 
 def cmd_status(config_path: str) -> int:
@@ -1250,27 +1571,23 @@ def cmd_status(config_path: str) -> int:
     else:
         print('Boot task "%s": %s' % (TASK_NAME, "ENABLED" if state else "DISABLED (re-enable it or re-run --install)"))
 
-    print("\nIn-memory NVMe patch (current process state):")
-    for target in PATCH_TARGETS:
-        _status_report_target(target)
+    cfg_fixes = load_config(config_path)["fixes"] if os.path.exists(config_path) else dict(DEFAULT_FIXES)
+
+    if not is_x86():
+        print("\nIn-memory patches: skipped -- unsupported architecture %s (x86-64 only)." % platform.machine())
+    else:
+        print("\nIn-memory NVMe patch (current process state):")
+        for target in PATCH_TARGETS:
+            _status_report_target(target)
+
+        ssd_on = cfg_fixes.get("ssd_slot_in_memory_patch", False)
+        print("\nIn-memory SSD-slot patch (%s):" % ("enabled" if ssd_on else "disabled -- set fixes.ssd_slot_in_memory_patch=true"))
+        _status_report_target(SSD_CAVE_TARGET)
 
     print("\nnoatime:")
     print("  root (/) noatime: %s" % ("yes" if root_is_noatime() else "NO"))
     relatime = find_relatime_volumes()
     print("  volumes on relatime: %s" % (", ".join(n for _u, n in relatime) if relatime else "none"))
-
-    print("\nsynocached idle timeout:")
-    conf = os.path.join(SYNOCACHED_DIR, "synocached.conf")
-    if os.path.exists(conf):
-        try:
-            val = "?"
-            with open(conf) as f:
-                for line in f:
-                    if line.startswith("timeout"):
-                        val = line.split()[1]
-            print("  %s: timeout %s" % (conf, val))
-        except Exception:
-            print("  %s: unreadable" % conf)
 
     if os.path.exists(config_path):
         cfg = load_config(config_path)
@@ -1288,6 +1605,9 @@ def cmd_diagnose() -> int:
     """Report pattern matches against the on-disk binaries and dump candidate sites
     if nothing matches (useful to regenerate patterns after a DSM update)."""
     print("== diagnose ==")
+    if not is_x86():
+        print("architecture %s is not x86-64; the byte patterns below are x86-64 only "
+              "and will not match." % platform.machine())
     for target in PATCH_TARGETS:
         print("\n%s (process %s):" % (target.binary_path, target.process_name))
         if not os.path.exists(target.binary_path):
@@ -1308,6 +1628,20 @@ def cmd_diagnose() -> int:
                 if b"\xBF\x01" in ctx or b"\xBF\x03" in ctx:
                     print("    off %#x: ...%s..." % (off, data[max(0, off - 24):off + 32].hex()))
             print("  Send this output to regenerate the patterns for your DSM build.")
+
+    # SSD-slot code cave (computed, not a pattern replacement)
+    print("\n%s (%s):" % (SSD_CAVE_TARGET.binary_path, SSD_CAVE_TARGET.name))
+    if not os.path.exists(SSD_CAVE_TARGET.binary_path):
+        print("  library not found")
+    else:
+        plan = build_ssd_cave_patch(open(SSD_CAVE_TARGET.binary_path, "rb").read())
+        if isinstance(plan, str):
+            print("  cannot build cave: %s" % plan)
+        else:
+            print("  hook @ %#x  %s -> %s" % (plan.hook_vaddr, plan.hook_orig.hex(), plan.hook_new.hex()))
+            print("  cave @ %#x  (%d bytes)  %s" % (plan.cave_vaddr, len(plan.cave_new), plan.cave_new.hex()))
+            print("  resolved: skip=%#x cont=%#x \"/dev/%%s\"=%#x snprintf@plt=%#x SYNODiskIsSSD@plt=%#x"
+                  % (plan.skip_vaddr, plan.cont_vaddr, plan.devfmt_vaddr, plan.snprintf_plt, plan.isssd_plt))
     return 0
 
 
@@ -1367,9 +1701,13 @@ def setup_logging(verbose: bool) -> None:
     log.addHandler(sh)
 
 
+def is_x86() -> bool:
+    # The in-memory byte patches are x86-64 machine code. Everything else (noatime, synocrond
+    # tuning, the hibernation debug logger) is architecture-independent and runs anywhere.
+    return platform.machine() == "x86_64"
+
+
 def preflight(require_root: bool = True) -> Optional[str]:
-    if platform.machine() != "x86_64":
-        return "Only x86_64-based NAS models are supported."
     major = syno_get_key_value(VERSION_PATH, "majorversion")
     if major and major != "7":
         return "This script targets DSM 7 (found major version %s)." % major
@@ -1381,16 +1719,13 @@ def preflight(require_root: bool = True) -> Optional[str]:
 def main(argv: List[str]) -> int:
     parser = argparse.ArgumentParser(description="Synology DSM HDD hibernation fixer")
     g = parser.add_mutually_exclusive_group(required=True)
-    g.add_argument("--install", action="store_true", help="install the boot task and apply fixes")
-    g.add_argument("--uninstall", action="store_true", help="remove the boot task")
-    g.add_argument("--restore", action="store_true", help="undo the config changes (from /var/synobackup)")
+    g.add_argument("--install", action="store_true", help="register the boot task (runs this script in place) and apply the fixes")
+    g.add_argument("--uninstall", action="store_true", help="remove the boot task and undo the config changes")
     g.add_argument("--run", action="store_true", help="apply all fixes now")
     g.add_argument("--status", action="store_true", help="show current state")
     g.add_argument("--diagnose", action="store_true", help="dump patch-site info")
     g.add_argument("--configure", action="store_true", help="interactively edit the config")
-    parser.add_argument("--install-dir", default=DEFAULT_INSTALL_DIR, help="install location (default %s)" % DEFAULT_INSTALL_DIR)
     parser.add_argument("--config", default=None, help="path to config file (default: next to the script)")
-    parser.add_argument("--purge", action="store_true", help="with --uninstall: also report leftover files/backups")
     parser.add_argument("-v", "--verbose", action="store_true", help="verbose console output")
     args = parser.parse_args(argv)
 
@@ -1406,11 +1741,9 @@ def main(argv: List[str]) -> int:
     config_path = args.config or config_path_for(script_path)
 
     if args.install:
-        return cmd_install(script_path, args.install_dir)
+        return cmd_install(script_path)
     if args.uninstall:
-        return cmd_uninstall(script_path, purge=args.purge)
-    if args.restore:
-        return cmd_restore()
+        return cmd_uninstall()
     if args.run:
         return cmd_run(config_path)
     if args.status:
