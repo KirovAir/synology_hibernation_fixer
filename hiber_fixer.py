@@ -67,6 +67,10 @@ SYNOINFO_CONF_PATH = "/etc/synoinfo.conf"
 VERSION_PATH = "/etc.defaults/VERSION"
 SYNO_HIBERNATION_LOG_LEVEL = "/proc/sys/kernel/syno_hibernation_log_level"
 HIBERNATION_DEBUG_SERVICE = "hibernationdebug.service"
+SYNODBUD_SERVICE = "synodbud_autoupdate.service"   # masked when the synodbud task is deleted
+# Every systemd service the tool may mask. --uninstall unmasks all of these unconditionally, so a
+# revert is complete even if the manifest lost track of a mask applied in an earlier run.
+MASKABLE_SERVICES = (SYNODBUD_SERVICE,)
 
 SYNOGETKEYVALUE = "/usr/syno/bin/synogetkeyvalue"
 SYNOSETKEYVALUE = "/usr/syno/bin/synosetkeyvalue"
@@ -1064,11 +1068,11 @@ def _handle_dyn_task_deletion(name: str) -> None:
             _save_manifest(m)
     elif name in ("builtin-synodbud-synodbud", "builtin-dyn-synodbud-default"):
         m = _load_manifest()
-        if "synodbud_autoupdate.service" not in m["services_masked"]:
-            m["services_masked"].append("synodbud_autoupdate.service")
+        if SYNODBUD_SERVICE not in m["services_masked"]:
+            m["services_masked"].append(SYNODBUD_SERVICE)
             _save_manifest(m)
-        run_cmd(["systemctl", "mask", "synodbud_autoupdate.service"])
-        run_cmd(["systemctl", "stop", "synodbud_autoupdate.service"])
+        run_cmd(["systemctl", "mask", SYNODBUD_SERVICE])
+        run_cmd(["systemctl", "stop", SYNODBUD_SERVICE])
         run_cmd(["synodbud", "-p"])
 
 
@@ -1511,9 +1515,18 @@ def restore_config_changes() -> None:
     """Restore every file the tool backed up (synocrond config/tasks, volume.conf) to its
     pristine pre-change content, and undo the recorded synoinfo/service side effects."""
     m = _load_manifest()
+
+    # Unmask the services the tool may mask, unioned with whatever the manifest recorded. This runs
+    # unconditionally (unmasking a service that isn't masked is a harmless no-op) so the revert is
+    # complete even if the manifest lost track of a mask applied in an earlier run.
+    services = sorted(set(MASKABLE_SERVICES) | set(m.get("services_masked", [])))
+    for svc in services:
+        run_cmd(["systemctl", "unmask", svc])
+
     files = m.get("files", {})
-    if not files and not m.get("synoinfo") and not m.get("services_masked"):
-        print("No config changes to undo (nothing recorded in %s)." % BACKUP_MANIFEST)
+    if not files and not m.get("synoinfo"):
+        print("Unmasked services: %s" % ", ".join(services))
+        print("No backed-up config files or synoinfo keys to restore.")
         return
 
     restored, failed = [], []
@@ -1531,8 +1544,6 @@ def restore_config_changes() -> None:
 
     for key, val in m.get("synoinfo", {}).items():
         syno_set_key_value(SYNOINFO_CONF_PATH, key, val)
-    for svc in m.get("services_masked", []):
-        run_cmd(["systemctl", "unmask", svc])
 
     # Refresh synocrond from the restored config.
     for p in ("/run/synocrond", "/run/synocrond.st.config", "/run/synocrond.config"):
@@ -1548,8 +1559,7 @@ def restore_config_changes() -> None:
     print("Restored %d config file(s) from %s." % (len(restored), BACKUP_DIR))
     if m.get("synoinfo"):
         print("Reverted synoinfo keys: %s" % ", ".join(sorted(m["synoinfo"])))
-    if m.get("services_masked"):
-        print("Unmasked services: %s" % ", ".join(m["services_masked"]))
+    print("Unmasked services: %s" % ", ".join(services))
     if failed:
         print("Could NOT restore:")
         for x in failed:
