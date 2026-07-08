@@ -89,8 +89,10 @@ The `synocrond_tasks` block lists DSM's scheduled jobs with an action for each: 
 `hourly`, `daily`, `weekly`, `monthly`, or `delete`. It ships with sensible defaults, and jobs from
 future DSM or package updates get added as `unchanged` so you can review them.
 
-Rather than editing this file by hand, `--configure` walks you through everything interactively:
-first each fix (on/off), then each scheduled job. After changing anything, run `--run` to apply it.
+Rather than editing this file by hand, `--configure` walks you through it. First each fix (on/off),
+then the scheduled jobs. Since there are usually around 50 of those, it asks upfront whether you want
+the recommended defaults, to review only the handful it has no recommendation for, or to go through
+every one. Run `--run` afterwards to apply whatever you changed.
 
 ## If it stops working after a DSM update
 

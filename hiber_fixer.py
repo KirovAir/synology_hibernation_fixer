@@ -1681,25 +1681,41 @@ def cmd_configure(config_path: str) -> int:
             print()
 
         names = sorted(set(discovered) | set(actions))
-        print("== Scheduled jobs ==   (Enter = keep current)")
-        print("Options: (u)nchanged (h)ourly (d)aily (w)eekly (m)onthly (x)delete\n")
-        for i, name in enumerate(names, 1):
-            cur_period = discovered.get(name, "(not present)")
-            descr = describe_task(name)
-            action = actions.get(name, "unchanged")
-            print("[%d/%d] %s" % (i, len(names), name))
-            if descr:
-                print("     %s" % descr)
-            print("     current interval: %s   action: %s" % (cur_period, action))
-            while True:
-                ch = input("     action [u/h/d/w/m/x]: ").strip().lower()
-                if not ch:
-                    break
-                if ch[0] in letter:
-                    actions[name] = letter[ch[0]]
-                    break
-                print("     invalid, try again")
-            print()
+        unknown = [n for n in names if n not in DEFAULT_TASK_ACTIONS]
+        print("== Scheduled jobs ==   %d found, %d with no built-in recommendation" % (len(names), len(unknown)))
+        print("  1) use the recommended defaults for all (no prompts)")
+        print("  2) review only the %d with no recommendation" % len(unknown))
+        print("  3) review every job one by one")
+        mode = ""
+        while mode not in ("1", "2", "3"):
+            mode = input("choice [1/2/3, Enter=1]: ").strip() or "1"
+            if mode not in ("1", "2", "3"):
+                print("  please enter 1, 2 or 3")
+        print()
+
+        if mode == "1":
+            for name in names:
+                actions[name] = DEFAULT_TASK_ACTIONS.get(name, "unchanged")
+        else:
+            review = unknown if mode == "2" else names
+            print("Enter = keep current. Options: (u)nchanged (h)ourly (d)aily (w)eekly (m)onthly (x)delete\n")
+            for i, name in enumerate(review, 1):
+                cur_period = discovered.get(name, "(not present)")
+                descr = describe_task(name)
+                action = actions.get(name, DEFAULT_TASK_ACTIONS.get(name, "unchanged"))
+                print("[%d/%d] %s" % (i, len(review), name))
+                if descr:
+                    print("     %s" % descr)
+                print("     current interval: %s   action: %s" % (cur_period, action))
+                while True:
+                    ch = input("     action [u/h/d/w/m/x, Enter=keep]: ").strip().lower()
+                    if not ch:
+                        break
+                    if ch[0] in letter:
+                        actions[name] = letter[ch[0]]
+                        break
+                    print("     invalid, try again")
+                print()
     except (KeyboardInterrupt, EOFError):
         print("\nCancelled; nothing saved.")
         return 1
