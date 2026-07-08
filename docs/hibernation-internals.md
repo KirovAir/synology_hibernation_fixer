@@ -167,6 +167,19 @@ None of these are hard-coded: `build_ssd_cave_patch()` locates the hook/skip by 
 resolves the cave address, the two PLT stubs and the string straight from the ELF, then assembles
 the cave. If anything can't be resolved it returns an error and refuses to patch.
 
+### eSATA SSDs
+
+The cave lives inside `DiskListIdleEnough`, and that function walks the whole list `scemd` builds
+from `SYNODiskPortEnum(1)` (internal SATA) **and `(2)`, which is external/eSATA**. It decides per
+disk by reading the `rotational` flag, not by port type, so an SSD on an eSATA port gets skipped
+exactly like one in an internal bay. So the fix should cover eSATA SSDs too, though I haven't tested
+one (no eSATA device on hand).
+
+One eSATA-specific blocker the cave does *not* touch: `polling_hibernation_timer` forces the gate to
+"not idle" whenever an eSATA disk carries a read-write HFS+ filesystem (`HasESATAWithRWHFSPlus()`),
+regardless of whether that disk is an SSD. It never even reaches `DiskListIdleEnough` in that case.
+Format such a drive ext4 or btrfs and it's a non-issue.
+
 ---
 
 ## 4. Safety of the cave patch
